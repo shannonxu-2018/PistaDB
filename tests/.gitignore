@@ -1,0 +1,17 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# tests/ — pytest runtime artifacts
+# ══════════════════════════════════════════════════════════════════════════════
+
+# pytest cache & bytecode
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Coverage reports
+.coverage
+htmlcov/
+coverage.xml
+
+# Temporary test databases created by tmp_path fixtures
+# (pytest writes them to system temp, but guard against any local leakage)
+*.pst

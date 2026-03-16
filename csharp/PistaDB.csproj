@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>8.0</LangVersion>
+    <RootNamespace>PistaDB</RootNamespace>
+    <AssemblyName>PistaDB</AssemblyName>
+    <Description>C# binding for PistaDB — lightweight embedded vector database</Description>
+    <Authors>PistaDB Contributors</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+</Project>

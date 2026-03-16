@@ -1,0 +1,6 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# example_dbs/ — Generated PistaDB database files
+# These are written at runtime by example.py and should not be committed.
+# The directory itself is tracked so the path exists after a fresh clone.
+# ══════════════════════════════════════════════════════════════════════════════
+*.pst

@@ -1,0 +1,113 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# PistaDB — Root .gitignore
+# Covers: C/C++ build artifacts, CMake, Python, IDE, OS, PistaDB databases
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── CMake build tree ──────────────────────────────────────────────────────────
+/build/
+
+# ── C / C++ compiled artifacts ───────────────────────────────────────────────
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.so.*
+*.dylib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.map
+*.tlog
+
+# ── CMake generated files (outside /build/) ──────────────────────────────────
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+
+# ── MSVC / Visual Studio solution & project files ────────────────────────────
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+x64/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# ── Python bytecode & cache ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ── Python packaging ──────────────────────────────────────────────────────────
+*.egg
+*.egg-info/
+dist/
+.eggs/
+*.whl
+MANIFEST
+pip-wheel-metadata/
+.Python
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+.conda/
+
+# ── pytest ────────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+
+# ── PistaDB database files ─────────────────────────────────────────────────────
+# Generated at runtime — never commit binary database blobs
+*.pst
+
+# ── IDE: VS Code ──────────────────────────────────────────────────────────────
+.vscode/
+*.code-workspace
+
+# ── IDE: JetBrains (CLion / PyCharm) ─────────────────────────────────────────
+.idea/
+cmake-build-*/
+*.iml
+
+# ── IDE: Vim / Emacs ─────────────────────────────────────────────────────────
+*.swp
+*.swo
+*~
+\#*\#
+.#*
+
+# ── OS: macOS ─────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ── OS: Windows ───────────────────────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── OS: Linux ─────────────────────────────────────────────────────────────────
+*~
+.fuse_hidden*
+.Trash-*
+
+# ── Claude Code workspace ─────────────────────────────────────────────────────
+.claude/

@@ -1,0 +1,12 @@
+[package]
+name        = "pistadb"
+version     = "0.1.0"
+edition     = "2021"
+description = "Rust binding for PistaDB — lightweight embedded vector database"
+license     = "MIT"
+readme      = "../README.md"
+
+# No external runtime dependencies — pure std + FFI
+[dependencies]
+
+[build-dependencies]
