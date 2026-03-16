@@ -142,6 +142,144 @@ db.save()
 | `L1` | Sparse feature vectors, BM25-style hybrid retrieval |
 | `HAMMING` | Binary embeddings, hash-based deduplication |
 
+### SIMD-Accelerated Distance Kernels
+
+All five distance functions are backed by hand-written SIMD kernels, selected automatically at **runtime** with zero configuration:
+
+| Architecture | ISA | Main loop | Typical speedup |
+|---|---|---|---|
+| x86-64 (Haswell+) | **AVX2 + FMA** | 16 floats/iter, dual-accumulator unroll, fused multiply-add | 4–8× vs. scalar |
+| ARM / Apple Silicon | **NEON** | 16 floats/iter (4× `float32x4_t`), 4-accumulator unroll | 3–5× vs. scalar |
+| Any other | Scalar | Standard C11 loop | baseline |
+
+**Runtime dispatch** — at first call, the CPU is probed once (via `__builtin_cpu_supports` on GCC/Clang, or `__cpuid` + `_xgetbv` on MSVC). The active function pointers are patched in-place; all subsequent calls jump directly to the best implementation with no branching.
+
+| Kernel | AVX2 technique | NEON technique |
+|---|---|---|
+| `vec_dot` / `dist_ip` | `_mm256_fmadd_ps` × 2 YMM | `vmlaq_f32` × 4 Q-regs |
+| `dist_l2sq` / `dist_l2` | `_mm256_sub_ps` → `_mm256_fmadd_ps` | `vsubq_f32` → `vmlaq_f32` |
+| `dist_cosine` | Single-pass 3-accumulator (dot, ‖a‖², ‖b‖²) | 6 Q-reg accumulators |
+| `dist_l1` | Sign-bit mask (`AND 0x7FFFFFFF`) | `vabsq_f32` → `vaddq_f32` |
+| `dist_hamming` | `_mm256_cmp_ps` + `movemask` + `popcount` | `vceqq_f32` + `vshrq_n_u32` + `vaddvq_u32` |
+
+The scalar fallback is always compiled in and gives identical numerical results — correctness is never traded for speed. The SIMD files (`distance_avx2.c`, `distance_neon.c`) are compiled with their own ISA flags (`-mavx2 -mfma` / no extra flag needed on AArch64) and linked into the same shared library.
+
+### Multi-Threaded Batch Insert
+
+For high-throughput embedding pipelines, PistaDB provides a **thread-pool + ring-buffer** batch insert API that decouples vector generation from index writes:
+
+```
+Producer thread 0 ──▶ ┌──────────────────┐
+Producer thread 1 ──▶ │  Ring-buffer     │──▶ Worker 0 ─┐
+Producer thread N ──▶ │  work queue      │──▶ Worker 1 ─┤──▶ pistadb_insert()
+                       │  (bounded MPMC)  │──▶ Worker M ─┘    (serialised)
+                       └──────────────────┘
+```
+
+**Streaming API** — for online pipelines where embeddings arrive continuously:
+
+```c
+#include "pistadb_batch.h"
+
+// Create a batch context: 4 workers, default queue capacity (4096)
+PistaDBBatch *batch = pistadb_batch_create(db, 4, 0);
+
+// Any number of producer threads may call push() concurrently.
+// The call blocks only when the queue is full (back-pressure).
+// vec is copied internally — caller may free it immediately.
+pistadb_batch_push(batch, id, label, vec);   // thread-safe
+
+// Wait for all queued items to finish
+int errors = pistadb_batch_flush(batch);     // 0 on full success
+
+pistadb_batch_destroy(batch);   // flush + shutdown workers + free memory
+```
+
+**Offline bulk API** — single blocking call for pre-loaded arrays:
+
+```c
+// ids[n], labels[n] (may be NULL), vecs[n × dim]
+// 0 workers → auto-detect hardware_concurrency
+int errors = pistadb_batch_insert(db, ids, labels, vecs, n, /*n_threads=*/0);
+```
+
+**Performance model:**
+
+| Scenario | Benefit |
+|---|---|
+| Embedding generation + indexing pipeline | Overlap compute (parallel embeds) with sequential index writes |
+| Multi-process embedding servers | Multiple producer threads push concurrently; one worker drains |
+| HNSW / DiskANN | Worker does graph-search (read-heavy) while next item is being prepared |
+| IVF / ScaNN | Centroid lookup (read-only) overlaps across items in queue |
+
+**Thread safety:** `pistadb_batch_push()` is safe to call from any number of threads simultaneously. All index writes are serialized internally — the underlying `PistaDB` handle does not need external locking while a batch context is active on it.
+
+**Platform:** Win32 `CRITICAL_SECTION` + `CONDITION_VARIABLE` on Windows; `pthread_mutex_t` + `pthread_cond_t` on Linux / macOS / Android / iOS. No external dependencies.
+
+### Embedding Cache — Automatic Input Deduplication
+
+Embedding APIs (OpenAI, Cohere, local models) are expensive. When the same text appears more than once — repeated queries, corpus deduplication, cached document chunks — re-encoding wastes time and money. The embedding cache eliminates redundant calls automatically.
+
+```
+┌──────────────────────────────────────────────────────┐
+│                   Your Application                   │
+│                                                      │
+│   text ──► CachedEmbedder ──► EmbeddingCache ──► hit │ ──► float32[]
+│                    │               (LRU map)          │
+│                    │ miss                             │
+│                    ▼                                  │
+│              embed_fn(text)   ← model call skipped   │
+│              (OpenAI / local)    on cache hit         │
+└──────────────────────────────────────────────────────┘
+```
+
+**C API** — `src/pistadb_cache.h`:
+
+```c
+// Open (or reload) a persistent cache
+PistaDBCache *cache = pistadb_cache_open("embed.pcc", /*dim=*/384, /*max=*/100000);
+
+float vec[384];
+if (!pistadb_cache_get(cache, text, vec)) {
+    my_model_encode(text, vec);           // ← only called on a miss
+    pistadb_cache_put(cache, text, vec);  // copy stored internally
+}
+// use vec …
+
+pistadb_cache_save(cache);   // flush to embed.pcc (survives restarts)
+pistadb_cache_close(cache);
+```
+
+**Python API** — `EmbeddingCache` + `CachedEmbedder`:
+
+```python
+from pistadb import EmbeddingCache, CachedEmbedder
+
+cache    = EmbeddingCache("embed.pcc", dim=384, max_entries=100_000)
+embedder = CachedEmbedder(openai_encode, cache, autosave_every=500)
+
+vec  = embedder("What is RAG?")      # calls OpenAI only on first access
+vecs = embedder.embed_batch(texts)   # np.ndarray (n, 384)
+
+print(cache.stats())
+# CacheStats(hits=4821, misses=179, evictions=0, count=179, hit_rate=96.4%)
+
+cache.close()
+```
+
+**Design details:**
+
+| Property | Value |
+|---|---|
+| Hash function | FNV-1a 64-bit, separate chaining |
+| Eviction policy | LRU (doubly-linked list, O(1) promote / evict) |
+| Rehash threshold | 75 % load factor, doubles bucket count |
+| Persistence format | `.pcc` binary — 64-byte header + variable-length entries |
+| Thread safety | Single internal mutex (all public functions protected) |
+| Byte order | Little-endian (all platforms) |
+
+The `.pcc` file stores entries in LRU-to-MRU order so a reload via sequential `put()` calls reconstructs the exact same LRU ordering.
+
 ### Single-File Storage — Ships With Your App
 
 - **One `.pst` file** contains everything: header, index graph, and raw vectors
@@ -1106,7 +1244,12 @@ PistaDB/
 ├── src/                          # C99 core — all platforms share this
 │   ├── pistadb_types.h           # Shared types, error codes, default params
 │   ├── pistadb.h / .c            # Primary database API
-│   ├── distance.h / .c           # 5 SIMD-friendly distance kernels
+│   ├── distance.h / .c           # Runtime dispatch + scalar fallbacks for 5 metrics
+│   ├── distance_simd.h           # Internal declarations for AVX2 / NEON kernels
+│   ├── distance_avx2.c           # AVX2+FMA kernels (compiled with -mavx2 -mfma)
+│   ├── distance_neon.c           # ARM NEON kernels (AArch64 built-in)
+│   ├── pistadb_batch.h / .c      # Multi-threaded batch insert (thread pool + ring queue)
+│   ├── pistadb_cache.h / .c      # Embedding cache (FNV-1a hash map + LRU list + .pcc file)
 │   ├── utils.h / .c              # Binary heap, PCG32 RNG, bitset
 │   ├── storage.h / .c            # File I/O, header CRC32
 │   ├── index_linear.*            # Exact brute-force scan
@@ -1189,15 +1332,15 @@ PistaDB/
 ## 🗺️ Roadmap
 
 **Core engine**
-- [ ] SIMD-accelerated distance kernels (AVX2 / NEON) for faster embedding comparisons
+- [x] SIMD-accelerated distance kernels (AVX2 / NEON) for faster embedding comparisons
 - [ ] Filtered search with metadata predicates (filter by source, date, tag before ANN)
-- [ ] Multi-threaded batch insert for high-throughput embedding pipelines
+- [x] Multi-threaded batch insert for high-throughput embedding pipelines
 
 **LLM & RAG ecosystem**
 - [ ] LangChain and LlamaIndex integration (drop-in vectorstore)
 - [ ] First-class support for OpenAI, Cohere, and sentence-transformers embedding dimensions
 - [ ] Hybrid search: dense vector + sparse BM25 re-ranking in a single query
-- [ ] Embedding cache layer — deduplicate identical inputs automatically
+- [x] Embedding cache layer — deduplicate identical inputs automatically
 
 **Portability**
 - [x] Android bindings — Java + Kotlin via JNI (`android/`)

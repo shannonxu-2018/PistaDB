@@ -142,6 +142,142 @@ db.save()
 | `L1` | 稀疏特征向量、BM25 式混合检索 |
 | `HAMMING` | 二值嵌入、哈希去重 |
 
+### SIMD 加速距离计算核
+
+全部 5 种距离函数均配备了手写 SIMD 内核，**运行时自动选择**，无需任何配置：
+
+| 架构 | ISA | 主循环策略 | 典型加速比 |
+|---|---|---|---|
+| x86-64（Haswell+） | **AVX2 + FMA** | 每次迭代 16 floats，双累加器展开，融合乘加 | 标量的 4–8× |
+| ARM / Apple Silicon | **NEON** | 每次迭代 16 floats（4× `float32x4_t`），4 累加器展开 | 标量的 3–5× |
+| 其他架构 | 标量 | 标准 C11 循环 | 基准线 |
+
+**运行时探测**——首次调用时对 CPU 进行一次探测（GCC/Clang 使用 `__builtin_cpu_supports`，MSVC 使用 `__cpuid` + `_xgetbv`），随即将函数指针原地替换为最优实现，此后所有调用直接跳转，无分支开销。
+
+| 计算核 | AVX2 技术 | NEON 技术 |
+|---|---|---|
+| `vec_dot` / `dist_ip` | `_mm256_fmadd_ps` × 2 YMM | `vmlaq_f32` × 4 Q-寄存器 |
+| `dist_l2sq` / `dist_l2` | `_mm256_sub_ps` → `_mm256_fmadd_ps` | `vsubq_f32` → `vmlaq_f32` |
+| `dist_cosine` | 单遍三路累加器（dot、‖a‖²、‖b‖²） | 6 个 Q-寄存器累加器 |
+| `dist_l1` | 符号位掩码（`AND 0x7FFFFFFF`）取绝对值 | `vabsq_f32` → `vaddq_f32` |
+| `dist_hamming` | `_mm256_cmp_ps` + `movemask` + `popcount` | `vceqq_f32` + `vshrq_n_u32` + `vaddvq_u32` |
+
+标量回退路径始终参与编译，数值结果与原始实现完全一致——速度提升不以正确性为代价。SIMD 文件（`distance_avx2.c`、`distance_neon.c`）各自以独立的 ISA 编译选项（`-mavx2 -mfma` / AArch64 无需额外标志）编译，链接进同一个共享库。
+
+### 多线程批量插入
+
+针对高吞吐量向量嵌入管道，PistaDB 提供了一套基于**线程池 + 有界环形缓冲队列**的批量插入 API，将向量生成与索引写入解耦：
+
+```
+生产者线程 0 ──▶ ┌──────────────────┐
+生产者线程 1 ──▶ │  环形缓冲队列     │──▶ 工作线程 0 ─┐
+生产者线程 N ──▶ │  (有界 MPMC)     │──▶ 工作线程 1 ─┤──▶ pistadb_insert()
+                 └──────────────────┘──▶ 工作线程 M ─┘    （已串行化）
+```
+
+**流式 API** — 适合向量嵌入持续到达的在线管道：
+
+```c
+#include "pistadb_batch.h"
+
+// 创建批量上下文：4 个工作线程，默认队列容量（4096）
+PistaDBBatch *batch = pistadb_batch_create(db, 4, 0);
+
+// 任意数量的生产者线程可同时调用 push()，线程安全。
+// 队列已满时阻塞（背压机制）；vec 内部拷贝，调用方可立即释放。
+pistadb_batch_push(batch, id, label, vec);   // 线程安全
+
+// 等待所有已入队项目完成插入
+int errors = pistadb_batch_flush(batch);     // 全部成功返回 0
+
+pistadb_batch_destroy(batch);   // flush + 关闭工作线程 + 释放内存
+```
+
+**离线批量 API** — 数据已全部就绪时的单次阻塞调用：
+
+```c
+// ids[n]、labels[n]（可为 NULL）、vecs[n × dim]
+// n_threads=0 → 自动探测 hardware_concurrency
+int errors = pistadb_batch_insert(db, ids, labels, vecs, n, /*n_threads=*/0);
+```
+
+**性能模型：**
+
+| 场景 | 收益 |
+|---|---|
+| 嵌入生成 + 索引写入流水线 | 并行嵌入计算与串行索引写入重叠 |
+| 多生产者嵌入服务 | 多线程并发 push，单工作线程消费 |
+| HNSW / DiskANN | 工作线程做图搜索（读密集）期间，下一项已就绪 |
+| IVF / ScaNN | 队列中多项的质心查询（只读）可并发预取 |
+
+**线程安全：** `pistadb_batch_push()` 可从任意线程安全调用。所有索引写入由内部锁串行化——批量上下文活跃期间，外部无需对 `PistaDB` 句柄加锁。
+
+**平台实现：** Windows 使用 `CRITICAL_SECTION` + `CONDITION_VARIABLE`；Linux / macOS / Android / iOS 使用 `pthread_mutex_t` + `pthread_cond_t`。零外部依赖。
+
+### 嵌入缓存层——自动对相同输入去重
+
+嵌入 API（OpenAI、Cohere、本地模型）调用成本高昂。当同一段文本多次出现时——重复查询、语料去重、文档分块缓存——重复编码既浪费时间又消耗金钱。嵌入缓存层可自动消除冗余调用。
+
+```
+┌──────────────────────────────────────────────────────┐
+│                      你的应用                        │
+│                                                      │
+│   文本 ──► CachedEmbedder ──► EmbeddingCache ──► 命中 │ ──► float32[]
+│                    │               (LRU 映射)         │
+│                    │ 未命中                           │
+│                    ▼                                  │
+│              embed_fn(text)    ← 缓存命中时           │
+│           （OpenAI / 本地模型）    跳过模型调用        │
+└──────────────────────────────────────────────────────┘
+```
+
+**C API** — `src/pistadb_cache.h`：
+
+```c
+// 打开（或加载）持久化缓存
+PistaDBCache *cache = pistadb_cache_open("embed.pcc", /*dim=*/384, /*max=*/100000);
+
+float vec[384];
+if (!pistadb_cache_get(cache, text, vec)) {
+    my_model_encode(text, vec);           // ← 仅在未命中时调用
+    pistadb_cache_put(cache, text, vec);  // 内部拷贝，调用方可立即释放
+}
+// 使用 vec …
+
+pistadb_cache_save(cache);   // 持久化到 embed.pcc（重启后依然有效）
+pistadb_cache_close(cache);
+```
+
+**Python API** — `EmbeddingCache` + `CachedEmbedder`：
+
+```python
+from pistadb import EmbeddingCache, CachedEmbedder
+
+cache    = EmbeddingCache("embed.pcc", dim=384, max_entries=100_000)
+embedder = CachedEmbedder(openai_encode, cache, autosave_every=500)
+
+vec  = embedder("什么是 RAG？")         # 首次访问时才调用 OpenAI
+vecs = embedder.embed_batch(texts)      # np.ndarray (n, 384)
+
+print(cache.stats())
+# CacheStats(hits=4821, misses=179, evictions=0, count=179, hit_rate=96.4%)
+
+cache.close()
+```
+
+**设计细节：**
+
+| 属性 | 值 |
+|---|---|
+| 哈希函数 | FNV-1a 64 位，独立链表法 |
+| 淘汰策略 | LRU（双向链表，O(1) 提升 / 淘汰） |
+| 扩容阈值 | 负载因子 75%，桶数量翻倍 |
+| 持久化格式 | `.pcc` 二进制——64 字节文件头 + 变长条目 |
+| 线程安全 | 单内部互斥锁（所有公共函数均受保护） |
+| 字节序 | 小端序（全平台一致） |
+
+`.pcc` 文件按 LRU→MRU 顺序存储条目，重新加载时通过顺序 `put()` 调用即可精确还原 LRU 排序。
+
 ### 单文件存储——与应用一同发布
 
 - **一个 `.pst` 文件**存储所有内容：文件头、索引图、原始向量数据
@@ -999,7 +1135,12 @@ PistaDB/
 ├── src/                          # C99 核心——所有平台共用
 │   ├── pistadb_types.h           # 公共类型、错误码、默认参数
 │   ├── pistadb.h / .c            # 主数据库 API
-│   ├── distance.h / .c           # 5 种 SIMD 友好的距离计算核
+│   ├── distance.h / .c           # 运行时 SIMD 探测与调度 + 标量回退
+│   ├── distance_simd.h           # AVX2 / NEON 内核内部声明
+│   ├── distance_avx2.c           # AVX2+FMA 内核（编译选项：-mavx2 -mfma）
+│   ├── distance_neon.c           # ARM NEON 内核（AArch64 内置，无需额外标志）
+│   ├── pistadb_batch.h / .c      # 多线程批量插入（线程池 + 环形缓冲队列）
+│   ├── pistadb_cache.h / .c      # 嵌入缓存（FNV-1a 哈希表 + LRU 链表 + .pcc 文件）
 │   ├── utils.h / .c              # 二叉堆、PCG32 随机数生成器、位图
 │   ├── storage.h / .c            # 文件 I/O、文件头 CRC32
 │   ├── index_linear.*            # 精确暴力扫描
@@ -1082,15 +1223,15 @@ PistaDB/
 ## 🗺️ 路线图
 
 **核心引擎**
-- [ ] SIMD 加速距离计算核（AVX2 / NEON），加速向量嵌入比较
+- [x] SIMD 加速距离计算核（AVX2 / NEON），加速向量嵌入比较
 - [ ] 带元数据谓词的过滤搜索（按来源、日期、标签先过滤再做 ANN）
-- [ ] 多线程批量插入，支持高吞吐量向量嵌入管道
+- [x] 多线程批量插入，支持高吞吐量向量嵌入管道
 
 **LLM 与 RAG 生态**
 - [ ] LangChain 和 LlamaIndex 集成（开箱即用的 vectorstore 适配器）
 - [ ] 原生支持 OpenAI、Cohere、sentence-transformers 常见嵌入维度的预设配置
 - [ ] 混合搜索：稠密向量 + 稀疏 BM25 重排序，单次查询完成
-- [ ] 嵌入缓存层——自动对相同输入去重，避免重复调用嵌入 API
+- [x] 嵌入缓存层——自动对相同输入去重，避免重复调用嵌入 API
 
 **可移植性**
 - [x] Android 绑定——通过 JNI 提供 Java + Kotlin API（`android/`）

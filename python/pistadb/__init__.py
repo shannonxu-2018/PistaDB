@@ -158,6 +158,39 @@ def _setup_argtypes(lib: ctypes.CDLL) -> None:
     lib.pistadb_free_buf.restype  = None
     lib.pistadb_free_buf.argtypes = [c_void_p]
 
+    # ── Embedding cache ───────────────────────────────────────────────────
+    lib.pistadb_cache_open.restype  = c_void_p
+    lib.pistadb_cache_open.argtypes = [c_char_p, c_int, c_int]
+
+    lib.pistadb_cache_save.restype  = c_int
+    lib.pistadb_cache_save.argtypes = [c_void_p]
+
+    lib.pistadb_cache_close.restype  = None
+    lib.pistadb_cache_close.argtypes = [c_void_p]
+
+    lib.pistadb_cache_get.restype  = c_int
+    lib.pistadb_cache_get.argtypes = [c_void_p, c_char_p,
+                                      ctypes.POINTER(c_float)]
+
+    lib.pistadb_cache_put.restype  = c_int
+    lib.pistadb_cache_put.argtypes = [c_void_p, c_char_p,
+                                      ctypes.POINTER(c_float)]
+
+    lib.pistadb_cache_contains.restype  = c_int
+    lib.pistadb_cache_contains.argtypes = [c_void_p, c_char_p]
+
+    lib.pistadb_cache_evict_key.restype  = c_int
+    lib.pistadb_cache_evict_key.argtypes = [c_void_p, c_char_p]
+
+    lib.pistadb_cache_clear.restype  = None
+    lib.pistadb_cache_clear.argtypes = [c_void_p]
+
+    lib.pistadb_cache_count.restype  = c_int
+    lib.pistadb_cache_count.argtypes = [c_void_p]
+
+    lib.pistadb_cache_stats.restype  = None
+    lib.pistadb_cache_stats.argtypes = [c_void_p, c_void_p]
+
 
 # ── Python enumerations ────────────────────────────────────────────────────────
 
@@ -571,6 +604,259 @@ def build_from_array(
     return db
 
 
+# ── Embedding cache ───────────────────────────────────────────────────────────
+
+@dataclass
+class CacheStats:
+    """Snapshot of EmbeddingCache statistics."""
+    hits:        int
+    misses:      int
+    evictions:   int
+    count:       int
+    max_entries: int
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return self.hits / total if total else 0.0
+
+    def __repr__(self):
+        return (
+            f"CacheStats(hits={self.hits}, misses={self.misses}, "
+            f"evictions={self.evictions}, count={self.count}, "
+            f"hit_rate={self.hit_rate:.1%})"
+        )
+
+
+class _CCacheStats(ctypes.Structure):
+    """ctypes mirror of PistaDBCacheStats."""
+    _fields_ = [
+        ("hits",        ctypes.c_uint64),
+        ("misses",      ctypes.c_uint64),
+        ("evictions",   ctypes.c_uint64),
+        ("count",       ctypes.c_int),
+        ("max_entries", ctypes.c_int),
+    ]
+
+
+class EmbeddingCache:
+    """
+    Persistent LRU embedding cache: text string → float32 vector.
+
+    Wraps the C ``pistadb_cache_*`` API.  Survives process restarts via a
+    ``.pcc`` binary file.  Thread-safe (mutex held inside the C layer).
+
+    Parameters
+    ----------
+    path : str | None
+        File path for persistence (``*.pcc``).  Pass ``None`` for an
+        in-memory-only cache that is never saved to disk.
+    dim : int
+        Embedding vector dimension.
+    max_entries : int
+        Capacity limit.  When full the least-recently-used entry is evicted.
+        0 = unlimited.
+
+    Example
+    -------
+    >>> cache = EmbeddingCache("embed.pcc", dim=384, max_entries=100_000)
+    >>> vec = cache.get("hello world")
+    >>> if vec is None:
+    ...     vec = my_model.encode("hello world")
+    ...     cache.put("hello world", vec)
+    >>> cache.save()
+    >>> cache.close()
+    """
+
+    def __init__(
+        self,
+        path: Optional[Union[str, Path]],
+        dim: int,
+        max_entries: int = 0,
+    ):
+        self._lib = _get_lib()
+        self._dim  = dim
+        self._path = str(path) if path is not None else None
+
+        handle = self._lib.pistadb_cache_open(
+            self._path.encode() if self._path else None,
+            ctypes.c_int(dim),
+            ctypes.c_int(max_entries),
+        )
+        if not handle:
+            raise MemoryError("pistadb_cache_open: allocation failed")
+        self._handle = handle
+
+    # ── Context manager ────────────────────────────────────────────────────
+
+    def __enter__(self) -> "EmbeddingCache":
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────
+
+    def save(self) -> None:
+        """Persist the cache to its .pcc file."""
+        r = self._lib.pistadb_cache_save(self._handle)
+        if r != 0:
+            raise IOError(f"pistadb_cache_save failed (code={r})")
+
+    def close(self) -> None:
+        """Free all resources.  Does NOT auto-save."""
+        if hasattr(self, "_handle") and self._handle:
+            self._lib.pistadb_cache_close(self._handle)
+            self._handle = None
+
+    def __del__(self):
+        self.close()
+
+    # ── Lookup / store ─────────────────────────────────────────────────────
+
+    def get(self, text: str) -> Optional[np.ndarray]:
+        """
+        Look up the cached embedding for ``text``.
+
+        Returns a float32 numpy array on a hit, or ``None`` on a miss.
+        The returned array is a copy — safe to modify.
+        """
+        out = np.empty(self._dim, dtype=np.float32)
+        hit = self._lib.pistadb_cache_get(
+            self._handle,
+            text.encode(),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        return out if hit else None
+
+    def put(self, text: str, vec: np.ndarray) -> None:
+        """
+        Store an embedding in the cache.
+
+        ``vec`` is copied — caller may free it immediately.
+        """
+        v = np.ascontiguousarray(vec, dtype=np.float32).ravel()
+        if len(v) != self._dim:
+            raise ValueError(f"Expected vector of dim {self._dim}, got {len(v)}")
+        r = self._lib.pistadb_cache_put(
+            self._handle,
+            text.encode(),
+            v.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        if r != 0:
+            raise MemoryError(f"pistadb_cache_put failed (code={r})")
+
+    def contains(self, text: str) -> bool:
+        """Return ``True`` if ``text`` is cached (does not touch LRU order)."""
+        return bool(self._lib.pistadb_cache_contains(self._handle, text.encode()))
+
+    def evict(self, text: str) -> bool:
+        """Remove a specific entry.  Returns ``True`` if the entry existed."""
+        return bool(self._lib.pistadb_cache_evict_key(self._handle, text.encode()))
+
+    def clear(self) -> None:
+        """Remove all entries (keeps file path and settings)."""
+        self._lib.pistadb_cache_clear(self._handle)
+
+    # ── Metadata ───────────────────────────────────────────────────────────
+
+    def stats(self) -> CacheStats:
+        """Return a snapshot of cache statistics."""
+        s = _CCacheStats()
+        self._lib.pistadb_cache_stats(self._handle, ctypes.byref(s))
+        return CacheStats(
+            hits=s.hits,
+            misses=s.misses,
+            evictions=s.evictions,
+            count=s.count,
+            max_entries=s.max_entries,
+        )
+
+    @property
+    def count(self) -> int:
+        """Number of entries currently in the cache."""
+        return self._lib.pistadb_cache_count(self._handle)
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __contains__(self, text: str) -> bool:
+        return self.contains(text)
+
+    def __repr__(self):
+        s = self.stats()
+        return (
+            f"EmbeddingCache(path={self._path!r}, dim={self._dim}, "
+            f"count={s.count}, hit_rate={s.hit_rate:.1%})"
+        )
+
+
+class CachedEmbedder:
+    """
+    Transparent caching wrapper around any embedding callable.
+
+    Checks the cache before calling the model; stores the result on a miss.
+    Optionally auto-saves the cache every ``autosave_every`` new entries.
+
+    Parameters
+    ----------
+    embed_fn : callable
+        ``embed_fn(text: str) -> np.ndarray`` — the expensive model call.
+    cache : EmbeddingCache
+        The cache to consult / populate.
+    autosave_every : int
+        Flush to disk after this many new embeddings.  0 = never.
+
+    Example
+    -------
+    >>> cache   = EmbeddingCache("embed.pcc", dim=384, max_entries=100_000)
+    >>> embedder = CachedEmbedder(my_model.encode, cache, autosave_every=500)
+    >>> vec = embedder("hello world")   # hits model only on first call
+    >>> cache.close()
+    """
+
+    def __init__(
+        self,
+        embed_fn,
+        cache: EmbeddingCache,
+        autosave_every: int = 0,
+    ):
+        self._fn             = embed_fn
+        self._cache          = cache
+        self._autosave_every = autosave_every
+        self._since_save     = 0
+
+    def __call__(self, text: str) -> np.ndarray:
+        vec = self._cache.get(text)
+        if vec is not None:
+            return vec
+        vec = np.ascontiguousarray(self._fn(text), dtype=np.float32).ravel()
+        self._cache.put(text, vec)
+        if self._autosave_every > 0:
+            self._since_save += 1
+            if self._since_save >= self._autosave_every:
+                self._cache.save()
+                self._since_save = 0
+        return vec
+
+    def embed_batch(self, texts) -> np.ndarray:
+        """
+        Encode a list of texts, using the cache for any already-seen strings.
+
+        Returns
+        -------
+        np.ndarray  shape (len(texts), dim), dtype float32
+        """
+        results = []
+        for t in texts:
+            results.append(self(t))
+        return np.stack(results)
+
+    @property
+    def cache(self) -> EmbeddingCache:
+        return self._cache
+
+
 __all__ = [
     "PistaDB",
     "Metric",
@@ -579,4 +865,7 @@ __all__ = [
     "SearchResult",
     "insert_batch",
     "build_from_array",
+    "EmbeddingCache",
+    "CachedEmbedder",
+    "CacheStats",
 ]

@@ -17,18 +17,36 @@
 
 /* 64-bit fseek: fseek(long) is 32-bit on Windows, silently truncates >2GB offsets. */
 #ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
 #  define FSEEK64(f, off, whence) _fseeki64((f), (__int64)(off), (whence))
 #else
 #  define FSEEK64(f, off, whence) fseeko((f), (off_t)(off), (whence))
 #endif
+
+/* ── Temp-file name: append ".tmp" to path ───────────────────────────────── */
+static char *make_tmp_path(const char *path)
+{
+    size_t n = strlen(path);
+    char *tmp = (char *)malloc(n + 5); /* ".tmp" + NUL */
+    if (!tmp) return NULL;
+    memcpy(tmp, path, n);
+    memcpy(tmp + n, ".tmp", 5);
+    return tmp;
+}
 
 int storage_write(const char *path,
                   PistaDBMetric metric, PistaDBIndexType idx_type,
                   uint32_t dim, uint64_t num_vectors, uint64_t next_id,
                   const void *vec_buf, size_t vec_size,
                   const void *idx_buf, size_t idx_size) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return PISTADB_EIO;
+    /* Write to a temp file first; rename into place on success so that a
+     * crash or I/O error mid-write never leaves a corrupted .pst file. */
+    char *tmp = make_tmp_path(path);
+    if (!tmp) return PISTADB_ENOMEM;
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { free(tmp); return PISTADB_EIO; }
 
     PistaDBFileHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -45,14 +63,32 @@ int storage_write(const char *path,
     hdr.vec_size      = (uint64_t)vec_size;
     hdr.idx_offset    = hdr.vec_offset + (uint64_t)vec_size;
     hdr.idx_size      = (uint64_t)idx_size;
-    hdr.header_crc    = crc32_compute(&hdr, 124);  /* CRC of bytes 0..123 */
+    hdr.header_crc    = crc32_compute(&hdr, 124);  /* CRC of bytes [0..123] */
 
     int ok = 1;
     ok = ok && (fwrite(&hdr,    1, sizeof(hdr), f) == sizeof(hdr));
     ok = ok && (fwrite(vec_buf, 1, vec_size,    f) == vec_size);
     ok = ok && (fwrite(idx_buf, 1, idx_size,    f) == idx_size);
+    ok = ok && (fflush(f) == 0);
     fclose(f);
-    return ok ? PISTADB_OK : PISTADB_EIO;
+
+    if (ok) {
+        /* Atomic rename: destination is replaced in a single filesystem op. */
+#ifdef _WIN32
+        /* MoveFileExA with MOVEFILE_REPLACE_EXISTING is atomic on NTFS. */
+        ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
+#else
+        ok = (rename(tmp, path) == 0);
+#endif
+    }
+
+    if (!ok) {
+        remove(tmp); /* clean up the temp file on failure */
+        free(tmp);
+        return PISTADB_EIO;
+    }
+    free(tmp);
+    return PISTADB_OK;
 }
 
 int storage_read_header(const char *path, PistaDBFileHeader *hdr) {

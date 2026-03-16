@@ -79,8 +79,8 @@ int heap_push(Heap *h, float key, uint64_t id) {
     }
     h->data[h->size].key = key;
     h->data[h->size].id  = id;
-    sift_up(h, h->size);
     h->size++;
+    sift_up(h, h->size - 1);
     return PISTADB_OK;
 }
 
