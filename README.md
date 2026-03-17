@@ -15,7 +15,7 @@ RAG-ready · Zero dependencies · Single-file storage · MIT Licensed</p>
 [![iOS](https://img.shields.io/badge/iOS-13%2B-lightgrey.svg)]()
 [![.NET](https://img.shields.io/badge/.NET-Standard%202.0%2B-512bd4.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Android%20%7C%20iOS-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-48%2F48%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-109%2F109%20passing-brightgreen.svg)]()
 
 </div>
 
@@ -280,6 +280,82 @@ cache.close()
 | Byte order | Little-endian (all platforms) |
 
 The `.pcc` file stores entries in LRU-to-MRU order so a reload via sequential `put()` calls reconstructs the exact same LRU ordering.
+
+### Transactions — Atomic Multi-Operation Groups
+
+PistaDB supports **ACID-style transactions** that let you stage any mix of INSERT, DELETE, and UPDATE operations and apply them as a single atomic unit. If any operation fails during commit, all previously applied operations are automatically rolled back.
+
+**C API** — `src/pistadb_txn.h`:
+
+```c
+#include "pistadb_txn.h"
+
+PistaDBTxn *txn = pistadb_txn_begin(db);
+
+pistadb_txn_insert(txn, 101, "doc_a", vec_a);
+pistadb_txn_insert(txn, 102, "doc_b", vec_b);
+pistadb_txn_delete(txn, 55);              // snapshot undo data at staging time
+pistadb_txn_update(txn, 77, vec_updated);
+
+int rc = pistadb_txn_commit(txn);
+if (rc == PISTADB_OK) {
+    /* all operations applied */
+} else if (rc == PISTADB_ETXN_PARTIAL) {
+    /* commit failed AND rollback could not fully undo (e.g. IVF-PQ) */
+    fprintf(stderr, "partial failure: %s\n", pistadb_txn_last_error(txn));
+} else {
+    /* commit failed, full rollback succeeded */
+    fprintf(stderr, "rolled back: %s\n", pistadb_txn_last_error(txn));
+}
+
+pistadb_txn_free(txn);
+```
+
+Rollback on demand:
+
+```c
+pistadb_txn_rollback(txn);   /* discard all staged ops, handle still usable */
+pistadb_txn_free(txn);
+```
+
+**Python API** — `Transaction` + context manager:
+
+```python
+from pistadb import PistaDB, Transaction
+
+with PistaDB("mydb.pst", dim=128) as db:
+    # Context-manager form — commits on clean exit, rolls back on exception
+    with db.begin_transaction() as txn:
+        txn.insert(101, vec_a, label="doc_a")
+        txn.insert(102, vec_b, label="doc_b")
+        txn.delete(55)
+        txn.update(77, vec_updated)
+    # committed here
+
+    # Manual form
+    txn = db.begin_transaction()
+    txn.insert(200, vec_c, label="doc_c")
+    try:
+        txn.commit()
+    except RuntimeError as e:
+        if getattr(e, "partial", False):
+            print("partial rollback failure:", e)
+        else:
+            print("rolled back:", e)
+    finally:
+        txn.free()
+```
+
+**Atomicity model:**
+
+| Phase | What happens |
+|---|---|
+| Staging | Operations validated locally (duplicate INSERT id check) |
+| Commit phase 1 | Structural validation (no duplicate ids across staged inserts) |
+| Commit phase 2 | Operations applied sequentially; undo snapshots captured at staging time |
+| Rollback | On failure at index `i`, ops `i-1 … 0` are undone in reverse order |
+
+**Note on IVF-PQ / ScaNN:** These index types do not store raw vectors (only PQ codes). A staged DELETE or UPDATE captures no undo vector. If commit fails and a PQ-only undo is required, the function returns `PISTADB_ETXN_PARTIAL = -10` rather than `PISTADB_OK`, indicating the database is in a partially-applied state that cannot be fully reversed automatically.
 
 ### Single-File Storage — Ships With Your App
 
@@ -1333,6 +1409,36 @@ db.save()
 | `scann_rerank_k` | Rerank candidates (higher = better recall, slower) | 5–20× the query `k` |
 | `scann_aq_eta` | Anisotropic penalty (0 = standard PQ) | `0.2` for cosine/IP; `0.0` for L2 |
 
+### Transactions
+
+```python
+from pistadb import PistaDB, Metric, Index
+import numpy as np
+
+dim = 128
+rng = np.random.default_rng(42)
+
+with PistaDB("mydb.pst", dim=dim, metric=Metric.COSINE, index=Index.HNSW) as db:
+    # Seed some data
+    for i in range(1, 6):
+        db.insert(i, rng.random(dim).astype("float32"), label=f"doc_{i}")
+
+    # Atomic batch: all-or-nothing
+    with db.begin_transaction() as txn:
+        txn.insert(10, rng.random(dim).astype("float32"), label="new_doc")
+        txn.delete(3)                                        # remove old entry
+        txn.update(1, rng.random(dim).astype("float32"))    # replace vector
+    # All three operations are now visible; none were visible before commit
+
+    # Automatic rollback on exception
+    try:
+        with db.begin_transaction() as txn:
+            txn.insert(20, rng.random(dim).astype("float32"), label="maybe")
+            raise ValueError("something went wrong")
+    except ValueError:
+        pass  # txn rolled back — id 20 was never inserted
+```
+
 ---
 
 ## 🧪 Running Tests
@@ -1346,7 +1452,7 @@ pytest tests\ -v
 PISTADB_LIB_DIR=build pytest tests/ -v
 ```
 
-**48 / 48 tests passing** — recall benchmarks, roundtrip persistence, corrupt-file rejection, metric correctness, and ScaNN two-phase search.
+**109 / 109 tests passing** — recall benchmarks, roundtrip persistence, corrupt-file rejection, metric correctness, ScaNN two-phase search, and transaction atomicity / rollback.
 
 ---
 
@@ -1361,7 +1467,7 @@ python examples/example.py
 PISTADB_LIB_DIR=build python examples/example.py
 ```
 
-The example script walks through all 9 scenarios: per-metric demos, all 7 index types (including ScaNN), batch build, DiskANN rebuild, persistence roundtrip, and delete/update operations.
+The example script walks through all 12 scenarios: per-metric demos, all 7 index types (including ScaNN), batch build, DiskANN rebuild, persistence roundtrip, delete/update operations, multi-threaded batch insert, and transaction atomicity / rollback.
 
 ---
 
@@ -1408,6 +1514,7 @@ PistaDB/
 │   ├── distance_neon.c           # ARM NEON kernels (AArch64 built-in)
 │   ├── pistadb_batch.h / .c      # Multi-threaded batch insert (thread pool + ring queue)
 │   ├── pistadb_cache.h / .c      # Embedding cache (FNV-1a hash map + LRU list + .pcc file)
+│   ├── pistadb_txn.h / .c        # Transaction API (atomic multi-op groups, undo-on-failure)
 │   ├── utils.h / .c              # Binary heap, PCG32 RNG, bitset
 │   ├── storage.h / .c            # File I/O, header CRC32
 │   ├── index_linear.*            # Exact brute-force scan
@@ -1483,9 +1590,9 @@ PistaDB/
 │   ├── PistaDBTypes.cs           # Metric/IndexType enums, SearchResult, PistaDBParams, exception
 │   └── PistaDatabase.cs          # Main class (IDisposable, thread-safe, async wrappers)
 ├── tests/
-│   └── test_pistadb.py           # 48-test pytest suite
+│   └── test_pistadb.py           # 109-test pytest suite
 ├── examples/
-│   └── example.py                # 8 end-to-end usage scenarios
+│   └── example.py                # 12 end-to-end usage scenarios
 ├── Package.swift                 # SPM manifest (CPistaDB → PistaDBObjC → PistaDB)
 ├── CMakeLists.txt
 ├── build.sh                      # Linux / macOS build script
@@ -1506,6 +1613,7 @@ PistaDB/
 - [ ] First-class support for OpenAI, Cohere, and sentence-transformers embedding dimensions
 - [ ] Hybrid search: dense vector + sparse BM25 re-ranking in a single query
 - [x] Embedding cache layer — deduplicate identical inputs automatically
+- [x] Transactions — atomic multi-operation groups with undo-on-failure rollback
 
 **Portability**
 - [x] Android bindings — Java + Kotlin via JNI (`android/`)
@@ -1529,7 +1637,7 @@ Pull requests are warmly welcomed. Whether it's a new index algorithm, a languag
 3. Commit your changes
 4. Open a Pull Request
 
-Please ensure all 48 tests continue to pass before submitting.
+Please ensure all 109 tests continue to pass before submitting.
 
 ---
 

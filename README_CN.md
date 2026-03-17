@@ -15,7 +15,7 @@ RAG 就绪 · 零外部依赖 · 单文件存储 · MIT 开源协议</p>
 [![iOS](https://img.shields.io/badge/iOS-13%2B-lightgrey.svg)]()
 [![.NET](https://img.shields.io/badge/.NET-Standard%202.0%2B-512bd4.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Android%20%7C%20iOS-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-48%2F48%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-109%2F109%20passing-brightgreen.svg)]()
 
 </div>
 
@@ -278,6 +278,82 @@ cache.close()
 | 字节序 | 小端序（全平台一致） |
 
 `.pcc` 文件按 LRU→MRU 顺序存储条目，重新加载时通过顺序 `put()` 调用即可精确还原 LRU 排序。
+
+### 事务——原子性多操作批次
+
+PistaDB 支持 **ACID 风格的事务**，可将任意 INSERT、DELETE、UPDATE 操作组合为一个原子执行单元。提交时若任何操作失败，已成功执行的操作将自动回滚。
+
+**C API** — `src/pistadb_txn.h`：
+
+```c
+#include "pistadb_txn.h"
+
+PistaDBTxn *txn = pistadb_txn_begin(db);
+
+pistadb_txn_insert(txn, 101, "doc_a", vec_a);
+pistadb_txn_insert(txn, 102, "doc_b", vec_b);
+pistadb_txn_delete(txn, 55);              // 暂存时捕获撤销快照
+pistadb_txn_update(txn, 77, vec_updated);
+
+int rc = pistadb_txn_commit(txn);
+if (rc == PISTADB_OK) {
+    /* 全部操作已应用 */
+} else if (rc == PISTADB_ETXN_PARTIAL) {
+    /* 提交失败且回滚不完整（如 IVF-PQ 索引缺少原始向量） */
+    fprintf(stderr, "partial failure: %s\n", pistadb_txn_last_error(txn));
+} else {
+    /* 提交失败，已完整回滚 */
+    fprintf(stderr, "rolled back: %s\n", pistadb_txn_last_error(txn));
+}
+
+pistadb_txn_free(txn);
+```
+
+手动回滚：
+
+```c
+pistadb_txn_rollback(txn);   /* 丢弃所有暂存操作，句柄仍可复用 */
+pistadb_txn_free(txn);
+```
+
+**Python API** — `Transaction` + 上下文管理器：
+
+```python
+from pistadb import PistaDB, Transaction
+
+with PistaDB("mydb.pst", dim=128) as db:
+    # 上下文管理器形式——正常退出时提交，发生异常时回滚
+    with db.begin_transaction() as txn:
+        txn.insert(101, vec_a, label="doc_a")
+        txn.insert(102, vec_b, label="doc_b")
+        txn.delete(55)
+        txn.update(77, vec_updated)
+    # 此处完成提交
+
+    # 手动形式
+    txn = db.begin_transaction()
+    txn.insert(200, vec_c, label="doc_c")
+    try:
+        txn.commit()
+    except RuntimeError as e:
+        if getattr(e, "partial", False):
+            print("部分回滚失败:", e)
+        else:
+            print("已回滚:", e)
+    finally:
+        txn.free()
+```
+
+**原子性模型：**
+
+| 阶段 | 说明 |
+|---|---|
+| 暂存 | 操作在本地校验（检测重复 INSERT id） |
+| 提交阶段一 | 结构校验（检查暂存 INSERT 中无重复 id） |
+| 提交阶段二 | 操作依次应用；撤销快照在暂存时已捕获 |
+| 回滚 | 操作 `i` 失败时，按逆序撤销 `i-1 … 0` |
+
+**关于 IVF-PQ / ScaNN 的注意事项：** 这两种索引类型仅存储 PQ 码，不保留原始向量。针对此类索引的 DELETE 或 UPDATE 操作无法捕获撤销向量。若提交失败且需要对 PQ 操作执行撤销，函数将返回 `PISTADB_ETXN_PARTIAL = -10`，表示数据库处于部分应用状态，无法自动完整恢复。
 
 ### 单文件存储——与应用一同发布
 
@@ -1198,6 +1274,36 @@ db.save()
 | `scann_rerank_k` | 重排序候选数量（越大召回率越高，速度越慢） | 查询 `k` 的 5–20 倍 |
 | `scann_aq_eta` | 各向异性惩罚（0 = 标准 PQ） | 余弦 / IP 用 `0.2`；L2 用 `0.0` |
 
+### 事务
+
+```python
+from pistadb import PistaDB, Metric, Index
+import numpy as np
+
+dim = 128
+rng = np.random.default_rng(42)
+
+with PistaDB("mydb.pst", dim=dim, metric=Metric.COSINE, index=Index.HNSW) as db:
+    # 初始化数据
+    for i in range(1, 6):
+        db.insert(i, rng.random(dim).astype("float32"), label=f"doc_{i}")
+
+    # 原子批次：全部成功或全部回滚
+    with db.begin_transaction() as txn:
+        txn.insert(10, rng.random(dim).astype("float32"), label="new_doc")
+        txn.delete(3)                                        # 删除旧条目
+        txn.update(1, rng.random(dim).astype("float32"))    # 替换向量
+    # 三个操作在此处同时生效；提交前均不可见
+
+    # 发生异常时自动回滚
+    try:
+        with db.begin_transaction() as txn:
+            txn.insert(20, rng.random(dim).astype("float32"), label="maybe")
+            raise ValueError("出错了")
+    except ValueError:
+        pass  # 事务已回滚——id 20 从未被插入
+```
+
 ---
 
 ## 🧪 运行测试
@@ -1211,7 +1317,7 @@ pytest tests\ -v
 PISTADB_LIB_DIR=build pytest tests/ -v
 ```
 
-**48 / 48 测试全部通过**，覆盖召回率基准测试、持久化往返测试、损坏文件拒绝加载、各距离度量正确性验证，以及 ScaNN 两阶段搜索专项测试。
+**109 / 109 测试全部通过**，覆盖召回率基准测试、持久化往返测试、损坏文件拒绝加载、各距离度量正确性验证、ScaNN 两阶段搜索专项测试，以及事务原子性与回滚测试。
 
 ---
 
@@ -1226,7 +1332,7 @@ python examples/example.py
 PISTADB_LIB_DIR=build python examples/example.py
 ```
 
-示例脚本演示了 9 个完整场景：各距离度量演示、全部 7 种索引类型（含 ScaNN）、批量构建、DiskANN 图重建、持久化往返验证、删除与更新操作。
+示例脚本演示了 12 个完整场景：各距离度量演示、全部 7 种索引类型（含 ScaNN）、批量构建、DiskANN 图重建、持久化往返验证、删除与更新操作、多线程批量插入，以及事务原子性与回滚。
 
 ---
 
@@ -1273,6 +1379,7 @@ PistaDB/
 │   ├── distance_neon.c           # ARM NEON 内核（AArch64 内置，无需额外标志）
 │   ├── pistadb_batch.h / .c      # 多线程批量插入（线程池 + 环形缓冲队列）
 │   ├── pistadb_cache.h / .c      # 嵌入缓存（FNV-1a 哈希表 + LRU 链表 + .pcc 文件）
+│   ├── pistadb_txn.h / .c        # 事务 API（原子多操作批次，失败自动回滚）
 │   ├── utils.h / .c              # 二叉堆、PCG32 随机数生成器、位图
 │   ├── storage.h / .c            # 文件 I/O、文件头 CRC32
 │   ├── index_linear.*            # 精确暴力扫描
@@ -1348,9 +1455,9 @@ PistaDB/
 │   ├── PistaDBTypes.cs           # Metric/IndexType 枚举、SearchResult、PistaDBParams、异常
 │   └── PistaDatabase.cs          # 主类（IDisposable、线程安全、异步封装）
 ├── tests/
-│   └── test_pistadb.py           # 48 个 pytest 测试用例
+│   └── test_pistadb.py           # 109 个 pytest 测试用例
 ├── examples/
-│   └── example.py                # 9 个端到端使用示例
+│   └── example.py                # 12 个端到端使用示例
 ├── Package.swift                 # SPM 清单（CPistaDB → PistaDBObjC → PistaDB）
 ├── CMakeLists.txt
 ├── build.sh                      # Linux / macOS 构建脚本
@@ -1371,6 +1478,7 @@ PistaDB/
 - [ ] 原生支持 OpenAI、Cohere、sentence-transformers 常见嵌入维度的预设配置
 - [ ] 混合搜索：稠密向量 + 稀疏 BM25 重排序，单次查询完成
 - [x] 嵌入缓存层——自动对相同输入去重，避免重复调用嵌入 API
+- [x] 事务支持——原子性多操作批次，失败时自动回滚
 
 **可移植性**
 - [x] Android 绑定——通过 JNI 提供 Java + Kotlin API（`android/`）
@@ -1394,7 +1502,7 @@ PistaDB/
 3. 提交你的修改
 4. 发起 Pull Request
 
-提交前请确保 48 个测试用例全部通过。
+提交前请确保 109 个测试用例全部通过。
 
 ---
 
