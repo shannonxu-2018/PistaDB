@@ -191,6 +191,36 @@ def _setup_argtypes(lib: ctypes.CDLL) -> None:
     lib.pistadb_cache_stats.restype  = None
     lib.pistadb_cache_stats.argtypes = [c_void_p, c_void_p]
 
+    # ── Transactions ──────────────────────────────────────────────────────
+    lib.pistadb_txn_begin.restype  = c_void_p
+    lib.pistadb_txn_begin.argtypes = [c_void_p]
+
+    lib.pistadb_txn_insert.restype  = c_int
+    lib.pistadb_txn_insert.argtypes = [c_void_p, c_uint64, c_char_p,
+                                       ctypes.POINTER(c_float)]
+
+    lib.pistadb_txn_delete.restype  = c_int
+    lib.pistadb_txn_delete.argtypes = [c_void_p, c_uint64]
+
+    lib.pistadb_txn_update.restype  = c_int
+    lib.pistadb_txn_update.argtypes = [c_void_p, c_uint64,
+                                       ctypes.POINTER(c_float)]
+
+    lib.pistadb_txn_commit.restype  = c_int
+    lib.pistadb_txn_commit.argtypes = [c_void_p]
+
+    lib.pistadb_txn_rollback.restype  = None
+    lib.pistadb_txn_rollback.argtypes = [c_void_p]
+
+    lib.pistadb_txn_free.restype  = None
+    lib.pistadb_txn_free.argtypes = [c_void_p]
+
+    lib.pistadb_txn_op_count.restype  = c_int
+    lib.pistadb_txn_op_count.argtypes = [c_void_p]
+
+    lib.pistadb_txn_last_error.restype  = c_char_p
+    lib.pistadb_txn_last_error.argtypes = [c_void_p]
+
 
 # ── Python enumerations ────────────────────────────────────────────────────────
 
@@ -556,6 +586,28 @@ class PistaDB:
             f"count={self.count})"
         )
 
+    # ── Transactions ───────────────────────────────────────────────────────
+
+    def begin_transaction(self) -> "Transaction":
+        """
+        Begin a new transaction on this database.
+
+        Returns a :class:`Transaction` handle.  Use as a context manager for
+        automatic commit/rollback, or call :meth:`Transaction.commit` and
+        :meth:`Transaction.rollback` manually.
+
+        Example
+        -------
+        >>> with db.begin_transaction() as txn:
+        ...     txn.insert(1, vec1, label="a")
+        ...     txn.insert(2, vec2, label="b")
+        ...     # auto-commits on clean exit; rolls back on exception
+        """
+        handle = self._lib.pistadb_txn_begin(self._handle)
+        if not handle:
+            raise MemoryError("pistadb_txn_begin: allocation failed")
+        return Transaction(self._lib, handle, self._dim)
+
 
 # ── Convenience batch helpers ─────────────────────────────────────────────────
 
@@ -857,6 +909,173 @@ class CachedEmbedder:
         return self._cache
 
 
+# ── Transaction ───────────────────────────────────────────────────────────────
+
+#: Return code from :func:`pistadb_txn_commit` when the commit partially
+#: succeeded and rollback of some operations was not possible.
+TXN_PARTIAL = -10
+
+
+class Transaction:
+    """
+    Atomic group of INSERT / DELETE / UPDATE operations on a :class:`PistaDB`.
+
+    Do not instantiate directly — use :meth:`PistaDB.begin_transaction`.
+
+    Commit semantics
+    ----------------
+    1. **Validation**: structural checks (e.g. duplicate INSERT ids) are
+       performed before any change is applied.  On failure the database is
+       untouched and a :class:`RuntimeError` is raised.
+
+    2. **Apply**: operations execute in staging order.  If any individual
+       operation fails, all previously applied ops are rolled back using
+       internally-saved undo snapshots.  If rollback is complete a
+       :class:`RuntimeError` is raised; if rollback is incomplete (e.g. for
+       IVF_PQ / ScaNN where raw vectors are not directly retrievable) a
+       :class:`RuntimeError` with ``partial=True`` is raised.
+
+    Undo availability
+    -----------------
+    * INSERT → undo = DELETE (always available)
+    * DELETE / UPDATE on LINEAR, HNSW, IVF, DiskANN, LSH → undo available
+    * DELETE / UPDATE on IVF_PQ → undo unavailable (PQ codes, not raw vectors)
+
+    Context-manager usage (recommended)
+    ------------------------------------
+    ::
+
+        with db.begin_transaction() as txn:
+            txn.insert(1, vec1, label="dog")
+            txn.delete(42)
+        # commits on clean exit; rolls back (and re-raises) on exception
+
+    Manual usage
+    ------------
+    ::
+
+        txn = db.begin_transaction()
+        try:
+            txn.insert(1, vec1)
+            txn.commit()
+        except Exception:
+            txn.rollback()
+        finally:
+            txn.free()
+    """
+
+    def __init__(self, lib: ctypes.CDLL, handle: int, dim: int):
+        self._lib    = lib
+        self._handle = handle
+        self._dim    = dim
+
+    # ── Context manager ────────────────────────────────────────────────────
+
+    def __enter__(self) -> "Transaction":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        self.free()
+        return False  # do not suppress exceptions
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────
+
+    def commit(self) -> None:
+        """
+        Validate and apply all staged operations atomically.
+
+        Raises
+        ------
+        RuntimeError
+            If validation fails (no changes applied) or if apply fails and
+            rollback completes successfully.
+        RuntimeError (with ``partial=True`` attribute)
+            If apply fails and rollback is incomplete.
+        """
+        r = self._lib.pistadb_txn_commit(self._handle)
+        if r != 0:
+            err = self._last_error
+            exc = RuntimeError(
+                f"pistadb_txn_commit failed (code={r}): {err}"
+            )
+            exc.partial = (r == TXN_PARTIAL)
+            raise exc
+
+    def rollback(self) -> None:
+        """Discard all staged operations without touching the database."""
+        self._lib.pistadb_txn_rollback(self._handle)
+
+    def free(self) -> None:
+        """Release all resources.  Implies rollback if not yet committed."""
+        if self._handle:
+            self._lib.pistadb_txn_free(self._handle)
+            self._handle = None
+
+    def __del__(self):
+        self.free()
+
+    # ── Staging operations ─────────────────────────────────────────────────
+
+    def insert(self, id: int, vector: np.ndarray, label: str = "") -> None:
+        """Stage an INSERT.  The vector is copied; caller may reuse it."""
+        vec = self._check_vec(vector)
+        r = self._lib.pistadb_txn_insert(
+            self._handle,
+            ctypes.c_uint64(id),
+            label.encode()[:255] if label else b"",
+            vec.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        self._raise_if(r, "txn_insert")
+
+    def delete(self, id: int) -> None:
+        """Stage a DELETE."""
+        r = self._lib.pistadb_txn_delete(self._handle, ctypes.c_uint64(id))
+        self._raise_if(r, "txn_delete")
+
+    def update(self, id: int, vector: np.ndarray) -> None:
+        """Stage an UPDATE.  The vector is copied; caller may reuse it."""
+        vec = self._check_vec(vector)
+        r = self._lib.pistadb_txn_update(
+            self._handle,
+            ctypes.c_uint64(id),
+            vec.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        self._raise_if(r, "txn_update")
+
+    # ── Introspection ──────────────────────────────────────────────────────
+
+    @property
+    def op_count(self) -> int:
+        """Number of staged (uncommitted) operations."""
+        return self._lib.pistadb_txn_op_count(self._handle)
+
+    @property
+    def _last_error(self) -> str:
+        s = self._lib.pistadb_txn_last_error(self._handle)
+        return s.decode() if s else ""
+
+    def __repr__(self):
+        return f"Transaction(op_count={self.op_count})"
+
+    # ── Internal helpers ───────────────────────────────────────────────────
+
+    def _check_vec(self, v: np.ndarray) -> np.ndarray:
+        v = np.ascontiguousarray(v, dtype=np.float32).ravel()
+        if len(v) != self._dim:
+            raise ValueError(f"Expected vector of dim {self._dim}, got {len(v)}")
+        return v
+
+    def _raise_if(self, code: int, op: str) -> None:
+        if code != 0:
+            raise RuntimeError(
+                f"pistadb_{op} failed (code={code}): {self._last_error}"
+            )
+
+
 __all__ = [
     "PistaDB",
     "Metric",
@@ -868,4 +1087,6 @@ __all__ = [
     "EmbeddingCache",
     "CachedEmbedder",
     "CacheStats",
+    "Transaction",
+    "TXN_PARTIAL",
 ]

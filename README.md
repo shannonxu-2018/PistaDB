@@ -10,6 +10,7 @@ RAG-ready · Zero dependencies · Single-file storage · MIT Licensed</p>
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C99](https://img.shields.io/badge/C-99-blue.svg)](https://en.wikipedia.org/wiki/C99)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab.svg)]()
+[![Go](https://img.shields.io/badge/Go-1.21%2B-00add8.svg)]()
 [![Android](https://img.shields.io/badge/Android-API%2021%2B-3ddc84.svg)]()
 [![iOS](https://img.shields.io/badge/iOS-13%2B-lightgrey.svg)]()
 [![.NET](https://img.shields.io/badge/.NET-Standard%202.0%2B-512bd4.svg)]()
@@ -299,6 +300,7 @@ PistaDB's core is written in pure C99. Every language binding wraps this same li
 |---|---|---|---|
 | **C / C++** | Direct `#include` | Native C API, zero overhead | `src/pistadb.h` |
 | **Python** | `ctypes` (no Cython) | Pythonic, NumPy-compatible | `python/` |
+| **Go** | CGO | Idiomatic Go, `io.Closer`, GC finalizers | `go/` |
 | **Java** | JNI | `AutoCloseable`, Builder, `synchronized` | `android/src/main/java/` |
 | **Kotlin** | JNI + extension functions | DSL builder, coroutines, operator overloads | `android/src/main/kotlin/` |
 | **Objective-C** | Direct C interop | Cocoa conventions, `NSError`, `NSLock` | `ios/Sources/PistaDBObjC/` |
@@ -950,6 +952,148 @@ db.save()?;
 
 ---
 
+## 🐹 Go Integration
+
+The `go/` directory is a standard Go module (`pistadb.io/go`) that wraps the native C library via **CGO**. It provides idiomatic Go types for all three APIs: database, batch insert, and embedding cache.
+
+### Module Setup
+
+Add the module as a local replace directive in your `go.mod`:
+
+```go
+// go.mod
+module myapp
+
+go 1.21
+
+require pistadb.io/go v0.0.0
+
+replace pistadb.io/go => ../PistaDB/go
+```
+
+Build the C library first, then build normally:
+
+```bash
+# Build C library (from PistaDB root)
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --parallel
+
+# Build your Go app
+go build ./...
+```
+
+To use a custom build directory, set `CGO_LDFLAGS`:
+
+```bash
+export CGO_LDFLAGS="-L/custom/path -lpistadb"
+go build ./...
+```
+
+### Basic Usage
+
+```go
+import "pistadb.io/go/pistadb"
+
+// Open or create a database
+db, err := pistadb.Open("knowledge.pst", 384,
+    pistadb.MetricCosine, pistadb.IndexHNSW, nil)
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
+
+// Insert a vector
+if err := db.Insert(1, "My first document", embedding); err != nil {
+    log.Fatal(err)
+}
+
+// K-nearest-neighbour search
+results, err := db.Search(queryVec, 10)
+if err != nil {
+    log.Fatal(err)
+}
+for _, r := range results {
+    fmt.Printf("id=%d  dist=%.4f  label=%q\n", r.ID, r.Distance, r.Label)
+}
+
+db.Save()
+```
+
+### Custom Parameters
+
+```go
+p := pistadb.DefaultParams()
+p.HNSWM = 32
+p.HNSWEfSearch = 100
+
+db, err := pistadb.Open("mydb.pst", 1536,
+    pistadb.MetricCosine, pistadb.IndexHNSW, &p)
+```
+
+### IVF / IVF_PQ (Train First)
+
+```go
+p := pistadb.DefaultParams()
+p.IVFNList  = 256
+p.IVFNProbe = 16
+
+db, _ := pistadb.Open("large.pst", 1536,
+    pistadb.MetricCosine, pistadb.IndexIVF, &p)
+
+db.Train()   // build centroids before inserting
+
+for i, vec := range corpus {
+    db.Insert(uint64(i+1), "", vec)
+}
+db.Save()
+```
+
+### Batch Insert
+
+```go
+// Streaming API — multiple goroutines push concurrently
+batch, _ := pistadb.NewBatch(db, 0, 0)   // 0 threads = auto, 0 cap = default 4096
+defer batch.Destroy()
+
+// producer goroutines call Push concurrently
+batch.Push(id, label, vec)
+
+errors := batch.Flush()   // wait for all items, reset per-flush counter
+
+// Offline bulk API — blocking convenience wrapper
+failures, err := pistadb.BatchInsert(db, ids, labels, vecs, 0)
+```
+
+### Embedding Cache
+
+```go
+cache, _ := pistadb.OpenCache("embed.pcc", 384, 100_000)
+defer cache.Close()
+
+vec, ok := cache.Get(text)
+if !ok {
+    vec = myModel.Encode(text)   // only called on a miss
+    cache.Put(text, vec)
+}
+// use vec …
+
+cache.Save()
+
+stats := cache.Stats()
+fmt.Printf("hits=%d  misses=%d  evictions=%d\n",
+    stats.Hits, stats.Misses, stats.Evictions)
+```
+
+### Running Tests
+
+```bash
+cd go
+go test ./pistadb/ -v
+```
+
+---
+
 ## 📦 Installation
 
 ### 1. Build the C Library
@@ -1011,7 +1155,21 @@ Or manually (GCC/Clang):
 g++ -std=c++17 -IPistaDB/cpp -IPistaDB/src main.cpp -Lbuild -lpistadb -o my_app
 ```
 
-### 6. Rust Integration
+### 6. Go Integration
+
+Add a `replace` directive in your `go.mod` pointing to `go/` in this repository, then build:
+
+```go
+replace pistadb.io/go => ../PistaDB/go
+```
+
+```bash
+export CGO_LDFLAGS="-L../PistaDB/build -lpistadb"
+go get pistadb.io/go/pistadb
+go build ./...
+```
+
+### 7. Rust Integration
 
 Set `PISTADB_LIB_DIR` to the directory containing the compiled native library, then build:
 
@@ -1020,7 +1178,7 @@ cd rust
 PISTADB_LIB_DIR=../build cargo build --release
 ```
 
-### 7. C# / .NET Integration
+### 8. C# / .NET Integration
 
 Add the `csharp/` project as a reference and ensure the native library is on the search path:
 
@@ -1032,7 +1190,7 @@ copy build\Release\pistadb.dll MyApp\bin\Debug\net8.0\
 export LD_LIBRARY_PATH=$PWD/build:$LD_LIBRARY_PATH
 ```
 
-### 8. iOS / macOS Integration (Swift Package Manager)
+### 9. iOS / macOS Integration (Swift Package Manager)
 
 In Xcode: **File → Add Package Dependencies** → point to this repository (or local checkout).
 Or add to your own `Package.swift`:
@@ -1262,6 +1420,13 @@ PistaDB/
 ├── python/                       # Python binding
 │   ├── pistadb/__init__.py       # Pure-ctypes wrapper (no Cython, no cffi)
 │   └── setup.py
+├── go/                           # Go binding (CGO)
+│   ├── go.mod                    # Module: pistadb.io/go (Go 1.21)
+│   └── pistadb/
+│       ├── pistadb.go            # Database: Open, Insert, Search, Get, …
+│       ├── batch.go              # Batch: NewBatch, Push, Flush, BatchInsert
+│       ├── cache.go              # Cache: OpenCache, Get, Put, Save, Stats
+│       └── pistadb_test.go       # Integration tests (go test ./pistadb/)
 ├── android/                      # Android integration layer
 │   ├── CMakeLists.txt            # NDK build (compiles C core + JNI bridge)
 │   ├── build.gradle              # Android library module (minSdk 21)
@@ -1348,6 +1513,7 @@ PistaDB/
 - [x] C# / .NET binding — P/Invoke, `IDisposable`, async/await (`csharp/`)
 - [x] Rust binding — FFI, `Send + Sync`, `Drop`, `Result<T, Error>` (`rust/`)
 - [x] C++ binding — header-only C++17, RAII, move-only, `std::mutex` (`cpp/pistadb.hpp`)
+- [x] Go binding — CGO, idiomatic Go types, GC finalizers, batch + cache APIs (`go/`)
 - [x] WASM build — Emscripten + Embind, ESM module, `Float32Array`, TypeScript types (`wasm/`)
 - [ ] WASM build — run full RAG pipelines in the browser
 - [ ] HTTP microserver mode (optional, single binary, for multi-process access)
@@ -1368,6 +1534,6 @@ Please ensure all 48 tests continue to pass before submitting.
 ---
 
 <div align="center">
-<strong>Built in C99 · C++ · WASM · Python · Java · Kotlin · Swift · Objective-C · C# · Rust · Runs anywhere · Keeps your data private</strong><br>
+<strong>Built in C99 · C++ · WASM · Python · Go · Java · Kotlin · Swift · Objective-C · C# · Rust · Runs anywhere · Keeps your data private</strong><br>
 <em>The best infrastructure for an LLM app is the kind you never have to think about.</em>
 </div>

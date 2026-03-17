@@ -359,6 +359,28 @@ int pistadb_get(PistaDB *db, uint64_t id, float *out_vec, char *out_label) {
             }
         }
     }
+    if (db->index_type == INDEX_HNSW) {
+        HNSWIndex *h = &db->idx.hnsw;
+        for (int i = 0; i < h->n_nodes; i++) {
+            if (h->nodes[i].vec_id == id && h->nodes[i].vec_id != UINT64_MAX) {
+                if (out_vec) memcpy(out_vec, h->vectors + (size_t)i * db->dim,
+                                    sizeof(float) * (size_t)db->dim);
+                if (out_label) { strncpy(out_label, h->labels[i], 255); out_label[255] = '\0'; }
+                return PISTADB_OK;
+            }
+        }
+    }
+    if (db->index_type == INDEX_DISKANN) {
+        DiskANNIndex *d = &db->idx.diskann;
+        for (int i = 0; i < d->n_nodes; i++) {
+            if (d->nodes[i].vec_id == id && !d->nodes[i].deleted) {
+                if (out_vec) memcpy(out_vec, d->vectors + (size_t)i * db->dim,
+                                    sizeof(float) * (size_t)db->dim);
+                if (out_label) { strncpy(out_label, d->labels[i], 255); out_label[255] = '\0'; }
+                return PISTADB_OK;
+            }
+        }
+    }
     return PISTADB_ENOTFOUND;
 }
 

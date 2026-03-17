@@ -4,9 +4,12 @@ PistaDB Usage Examples
 =====================
 Demonstrates all major features:
   - All 5 distance metrics
-  - All 6 index algorithms
+  - All 7 index algorithms (including ScaNN)
   - CRUD operations
   - Persistence (save / load)
+  - ScaNN: anisotropic vector quantization, two-phase search
+  - Embedding cache: LRU persistent cache, CachedEmbedder
+  - Multi-threaded batch insert: streaming API + offline bulk API
   - Performance benchmarking
 
 Requirements:
@@ -20,11 +23,15 @@ Run:
 import sys
 import os
 import time
+import threading
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
-from pistadb import PistaDB, Metric, Index, Params, build_from_array
+from pistadb import (
+    PistaDB, Metric, Index, Params, build_from_array,
+    EmbeddingCache, CachedEmbedder, Transaction,
+)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 DIM    = 64
@@ -354,6 +361,495 @@ def example_diskann():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Example 9: ScaNN – Anisotropic Vector Quantization
+# ──────────────────────────────────────────────────────────────────────────────
+
+def example_scann():
+    print("\n" + "="*60)
+    print("Example 9: ScaNN – Anisotropic Vector Quantization")
+    print("="*60)
+    print("  Two-phase search: fast ADC scoring → exact reranking")
+
+    # ScaNN shines on cosine/IP workloads with large datasets.
+    # dim must be divisible by scann_pq_M.
+    # Train on the same vectors that will be indexed (same distribution)
+    # so that centroids and PQ codebooks are well-calibrated.
+    n_index = 500
+    dim     = 32   # 32 / 8 = 4 floats per PQ sub-space
+
+    raw_vecs   = rng.random((n_index, dim), dtype=np.float32)
+    # L2-normalise → cosine workload (simulates real embedding outputs)
+    norms      = np.linalg.norm(raw_vecs, axis=1, keepdims=True)
+    index_vecs = (raw_vecs / norms).astype(np.float32)
+    query      = rng.random(dim, dtype=np.float32)
+    query      = (query / np.linalg.norm(query)).astype(np.float32)
+
+    # Ground-truth top-K (exact cosine, i.e. highest dot product)
+    dots   = index_vecs @ query
+    gt_ids = set(np.argsort(-dots)[:K] + 1)
+
+    # ── Parameter sweep: nprobe → recall vs. latency ──────────────────────
+    print(f"\n  {'nprobe':>8s}  {'rerank_k':>9s}  {'latency':>10s}  {'recall@10':>10s}")
+    print("  " + "-" * 48)
+    for nprobe in (2, 4, 8, 16):
+        rerank_k = max(K * 5, nprobe * 8)
+        params   = Params(
+            scann_nlist    = 16,        # coarse IVF partitions
+            scann_nprobe   = nprobe,    # partitions probed per query
+            scann_pq_M     = 8,         # PQ sub-spaces
+            scann_pq_bits  = 8,         # 8-bit sub-codes
+            scann_rerank_k = rerank_k,  # exact reranking candidates
+            scann_aq_eta   = 0.2,       # anisotropic penalty η
+        )
+        path_s = os.path.join(DB_DIR, f"scann_np{nprobe}.pst")
+        db_s   = PistaDB(path_s, dim=dim, metric=Metric.COSINE,
+                         index=Index.SCANN, params=params)
+        # Train on the same normalised corpus
+        db_s.train(index_vecs)
+        for i, v in enumerate(index_vecs):
+            db_s.insert(i + 1, v, label=f"doc_{i}")
+        t0  = time.perf_counter()
+        res = db_s.search(query, k=K)
+        lat = (time.perf_counter() - t0) * 1000
+        rec = len({r.id for r in res} & gt_ids) / K
+        db_s.close()
+        print(f"  {nprobe:>8d}  {rerank_k:>9d}  {lat:>9.3f}ms  {rec:>9.1%}")
+
+    # ── Full example with best params ─────────────────────────────────────
+    print(f"\n  Full run (nprobe=16, rerank_k=100):")
+    params = Params(scann_nlist=16, scann_nprobe=16,
+                    scann_pq_M=8, scann_pq_bits=8,
+                    scann_rerank_k=100, scann_aq_eta=0.2)
+    path = os.path.join(DB_DIR, "scann.pst")
+    db   = PistaDB(path, dim=dim, metric=Metric.COSINE,
+                   index=Index.SCANN, params=params)
+
+    t0 = time.perf_counter()
+    db.train(index_vecs)
+    print(f"  Training ({n_index} vecs): {(time.perf_counter()-t0)*1000:.1f} ms")
+
+    t0 = time.perf_counter()
+    for i, v in enumerate(index_vecs):
+        db.insert(i + 1, v, label=f"doc_{i}")
+    t_insert = time.perf_counter() - t0
+    print(f"  Insert  ({n_index} vecs): {t_insert*1000:.1f} ms  "
+          f"({n_index/t_insert:.0f} vec/s)")
+
+    t0      = time.perf_counter()
+    results = db.search(query, k=K)
+    t_search = time.perf_counter() - t0
+    recall   = len({r.id for r in results} & gt_ids) / K
+    print(f"  Search  (k={K}): {t_search*1000:.3f} ms  |  recall@{K}={recall:.1%}")
+    print_results(results, "ScaNN top-5 (cosine)")
+
+    db.save()
+    db.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Example 10: Embedding cache
+# ──────────────────────────────────────────────────────────────────────────────
+
+def example_embedding_cache():
+    print("\n" + "="*60)
+    print("Example 10: Embedding Cache (LRU + persistent .pcc file)")
+    print("="*60)
+    print("  Avoids re-encoding identical texts; survives restarts.")
+
+    cache_path = os.path.join(DB_DIR, "embed_cache.pcc")
+    dim        = DIM
+
+    # ── Simulate an expensive embedding model ─────────────────────────────
+    call_count = [0]
+    def fake_embed(text: str) -> np.ndarray:
+        """Deterministic 'embedding' based on text hash; 1 ms simulated cost."""
+        call_count[0] += 1
+        seed = hash(text) & 0xFFFF_FFFF
+        v    = np.random.default_rng(seed).random(dim, dtype=np.float32)
+        time.sleep(0.001)   # simulate network / GPU latency
+        return v
+
+    # ── Part A: basic get / put ────────────────────────────────────────────
+    print("\n  [A] Basic get / put")
+    cache = EmbeddingCache(cache_path, dim=dim, max_entries=1000)
+
+    texts = [
+        "PistaDB stores vectors locally with zero dependencies.",
+        "HNSW delivers sub-millisecond approximate nearest-neighbour search.",
+        "RAG improves LLM output by injecting retrieved context.",
+        "ScaNN uses anisotropic quantization for high-recall cosine search.",
+        "The embedding cache deduplicates repeated model calls automatically.",
+    ]
+
+    # First pass – all misses, model is called
+    t0 = time.perf_counter()
+    for t in texts:
+        vec = cache.get(t)
+        if vec is None:
+            vec = fake_embed(t)
+            cache.put(t, vec)
+    t_first = time.perf_counter() - t0
+    s = cache.stats()
+    print(f"  First pass  (all misses): {t_first*1000:.1f} ms  "
+          f"| hits={s.hits}  misses={s.misses}  model_calls={call_count[0]}")
+
+    # Second pass – all hits, model is NOT called
+    call_before = call_count[0]
+    t0 = time.perf_counter()
+    for t in texts:
+        vec = cache.get(t)
+        assert vec is not None, f"Expected a cache hit for: {t!r}"
+    t_second = time.perf_counter() - t0
+    s = cache.stats()
+    print(f"  Second pass (all hits) : {t_second*1000:.1f} ms  "
+          f"| hits={s.hits}  misses={s.misses}  model_calls={call_count[0]-call_before}")
+    print(f"  Speedup: {t_first/t_second:.0f}x  |  hit_rate={s.hit_rate:.1%}")
+
+    # ── Part B: persistence across restarts ───────────────────────────────
+    print("\n  [B] Persistence – save, re-open, verify hits")
+    cache.save()
+    cache.close()
+    print(f"  Saved {len(texts)} entries to {cache_path}")
+
+    cache2 = EmbeddingCache(cache_path, dim=dim, max_entries=1000)
+    hit_count = sum(1 for t in texts if cache2.get(t) is not None)
+    print(f"  After reload: {hit_count}/{len(texts)} entries recovered")
+    cache2.close()
+
+    # ── Part C: LRU eviction ──────────────────────────────────────────────
+    print("\n  [C] LRU eviction (capacity=5)")
+    cap = 5
+    small_cache = EmbeddingCache(
+        os.path.join(DB_DIR, "lru_demo.pcc"), dim=dim, max_entries=cap)
+
+    print(f"  Inserting 8 entries into a cache of capacity {cap}:")
+    for i in range(8):
+        v = np.random.default_rng(i).random(dim, dtype=np.float32)
+        small_cache.put(f"entry_{i}", v)
+        s = small_cache.stats()
+        print(f"    put entry_{i}  → count={s.count}  evictions={s.evictions}")
+
+    # Access entry_7 (MRU) and entry_6 to make them hot
+    small_cache.get("entry_7")
+    small_cache.get("entry_6")
+    # Insert one more – LRU entries (3, 4, 5) have already been evicted
+    small_cache.put("entry_8", np.ones(dim, dtype=np.float32))
+    print(f"  entry_7 still in cache: {small_cache.contains('entry_7')}")
+    print(f"  entry_0 still in cache: {small_cache.contains('entry_0')}")
+    small_cache.close()
+
+    # ── Part D: CachedEmbedder high-level wrapper ─────────────────────────
+    print("\n  [D] CachedEmbedder – transparent cache wrapper")
+    call_count[0] = 0
+    fresh_cache = EmbeddingCache(
+        os.path.join(DB_DIR, "embedder.pcc"), dim=dim, max_entries=500)
+    embedder = CachedEmbedder(fake_embed, fresh_cache, autosave_every=3)
+
+    corpus = [
+        "neural information retrieval",
+        "dense passage retrieval with BERT",
+        "approximate nearest neighbour algorithms",
+        "neural information retrieval",     # duplicate – should hit cache
+        "product quantization for fast ANN",
+        "dense passage retrieval with BERT", # duplicate
+    ]
+
+    print(f"  Encoding {len(corpus)} texts ({len(set(corpus))} unique):")
+    t0 = time.perf_counter()
+    vecs = embedder.embed_batch(corpus)
+    t_total = time.perf_counter() - t0
+    s = fresh_cache.stats()
+    print(f"    model_calls={call_count[0]}  hits={s.hits}  "
+          f"misses={s.misses}  hit_rate={s.hit_rate:.1%}")
+    print(f"    batch shape: {vecs.shape}  time: {t_total*1000:.1f} ms")
+    print(f"    autosave triggered: {os.path.exists(embedder.cache._path)}")
+
+    # Build a searchable database from the unique embeddings
+    db_path   = os.path.join(DB_DIR, "cached_rag.pst")
+    unique    = list(set(corpus))
+    u_vecs    = np.stack([embedder(t) for t in unique])
+    with PistaDB(db_path, dim=dim, metric=Metric.COSINE,
+                 index=Index.HNSW) as db:
+        for i, (t, v) in enumerate(zip(unique, u_vecs)):
+            db.insert(i + 1, v, label=t[:64])
+        q_vec = embedder("information retrieval methods")
+        res   = db.search(q_vec, k=3)
+    print(f"\n  RAG query: 'information retrieval methods'")
+    print_results(res, "Cosine top-3 from cached embeddings")
+
+    fresh_cache.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Example 11: Multi-threaded batch insert
+# ──────────────────────────────────────────────────────────────────────────────
+
+def example_multithreaded_batch():
+    print("\n" + "="*60)
+    print("Example 11: Multi-threaded Batch Insert")
+    print("="*60)
+    print("  Thread pool + bounded queue; producers run concurrently with indexing.")
+
+    # We compare three strategies for inserting N_BATCH vectors:
+    #   (a) single-threaded sequential insert
+    #   (b) offline bulk API   – pistadb_batch_insert (auto thread-count)
+    #   (c) streaming API      – multiple Python threads push concurrently
+
+    N_BATCH = 2000
+    dim     = DIM
+    vecs    = rng.random((N_BATCH, dim), dtype=np.float32)
+    ids     = list(range(1, N_BATCH + 1))
+
+    # ── (a) Baseline: single-threaded sequential ──────────────────────────
+    print(f"\n  [A] Single-threaded sequential insert ({N_BATCH} vecs)")
+    path_a = os.path.join(DB_DIR, "batch_sequential.pst")
+    db_a   = PistaDB(path_a, dim=dim, metric=Metric.L2, index=Index.HNSW)
+    t0     = time.perf_counter()
+    for i, v in enumerate(vecs):
+        db_a.insert(ids[i], v, label=f"v{i}")
+    t_seq = time.perf_counter() - t0
+    print(f"    Inserted {N_BATCH} vectors in {t_seq*1000:.1f} ms  "
+          f"({N_BATCH/t_seq:.0f} vec/s)")
+    db_a.save()
+    db_a.close()
+
+    # ── (b) Offline bulk: build_from_array (uses single-pass insert) ──────
+    print(f"\n  [B] build_from_array bulk helper ({N_BATCH} vecs)")
+    path_b  = os.path.join(DB_DIR, "batch_bulk.pst")
+    labels  = [f"v{i}" for i in range(N_BATCH)]
+    t0      = time.perf_counter()
+    db_b    = build_from_array(path_b, vecs, ids=ids, labels=labels,
+                                metric=Metric.L2, index=Index.HNSW)
+    t_bulk  = time.perf_counter() - t0
+    print(f"    Inserted {N_BATCH} vectors in {t_bulk*1000:.1f} ms  "
+          f"({N_BATCH/t_bulk:.0f} vec/s)  count={db_b.count}")
+    db_b.save()
+    db_b.close()
+
+    # ── (c) Streaming: multiple Python producer threads ───────────────────
+    # PistaDB inserts are not thread-safe; the typical pattern is to have
+    # worker threads do the expensive CPU/IO work (e.g., embedding) and then
+    # serialize the actual insert with a lock.
+    n_cpus = os.cpu_count() or 4
+    print(f"\n  [C] Streaming API – {n_cpus} producer threads ({N_BATCH} vecs)")
+    path_c      = os.path.join(DB_DIR, "batch_streaming.pst")
+    db_c        = PistaDB(path_c, dim=dim, metric=Metric.L2, index=Index.HNSW)
+    insert_lock = threading.Lock()
+
+    # Chunk the work across producer threads
+    n_producers = min(n_cpus, 8)
+    chunk_size  = N_BATCH // n_producers
+    push_times  = []
+
+    def producer(start: int, end: int):
+        t_prod = time.perf_counter()
+        for i in range(start, end):
+            # Simulate per-item work (e.g., embedding) done in parallel,
+            # then acquire the lock only for the actual insert.
+            vec_i = vecs[i]          # parallel "work"
+            with insert_lock:
+                db_c.insert(ids[i], vec_i, label=f"v{i}")
+        push_times.append(time.perf_counter() - t_prod)
+
+    t0      = time.perf_counter()
+    threads = []
+    for p in range(n_producers):
+        s = p * chunk_size
+        e = s + chunk_size if p < n_producers - 1 else N_BATCH
+        t = threading.Thread(target=producer, args=(s, e))
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+    t_stream = time.perf_counter() - t0
+
+    print(f"    {n_producers} producer threads finished in {t_stream*1000:.1f} ms  "
+          f"({N_BATCH/t_stream:.0f} vec/s)  count={db_c.count}")
+    print(f"    Per-producer wall time: "
+          f"min={min(push_times)*1000:.1f}ms  "
+          f"max={max(push_times)*1000:.1f}ms")
+
+    db_c.save()
+    db_c.close()
+
+    # ── Summary table ─────────────────────────────────────────────────────
+    print(f"\n  {'Strategy':30s} {'Time':>10s} {'vec/s':>10s}")
+    print("  " + "-" * 55)
+    for name, t in [("(A) Sequential",      t_seq),
+                    ("(B) build_from_array", t_bulk),
+                    ("(C) Streaming threads", t_stream)]:
+        print(f"  {name:30s} {t*1000:>9.1f}ms {N_BATCH/t:>9.0f}")
+
+    # ── (d) Combine batch insert with the embedding cache ─────────────────
+    print(f"\n  [D] Cache-assisted pipeline: deduplicate → batch-insert")
+    docs = [
+        "vector databases enable semantic search",
+        "HNSW is the fastest graph-based ANN index",
+        "vector databases enable semantic search",   # duplicate
+        "ScaNN uses product quantization and reranking",
+        "HNSW is the fastest graph-based ANN index", # duplicate
+        "RAG combines retrieval with generation",
+        "embedding caches reduce API costs significantly",
+        "RAG combines retrieval with generation",    # duplicate
+    ]
+
+    call_counter = [0]
+    def cheap_embed(text):
+        call_counter[0] += 1
+        seed = hash(text) & 0xFFFF_FFFF
+        return np.random.default_rng(seed).random(dim, dtype=np.float32)
+
+    dedup_cache = EmbeddingCache(
+        os.path.join(DB_DIR, "dedup.pcc"), dim=dim)
+    embedder    = CachedEmbedder(cheap_embed, dedup_cache)
+
+    # Embed with deduplication
+    unique_texts, unique_vecs, unique_ids = [], [], []
+    seen = {}
+    for doc in docs:
+        if doc not in seen:
+            v = embedder(doc)
+            seen[doc] = len(unique_texts) + 1
+            unique_texts.append(doc)
+            unique_vecs.append(v)
+            unique_ids.append(seen[doc])
+
+    print(f"    {len(docs)} docs → {len(unique_texts)} unique  "
+          f"(model_calls={call_counter[0]}  "
+          f"hits={dedup_cache.stats().hits})")
+
+    # Batch-insert only the unique vectors
+    path_d = os.path.join(DB_DIR, "dedup_index.pst")
+    db_d   = build_from_array(
+        path_d,
+        np.stack(unique_vecs),
+        ids    = unique_ids,
+        labels = [t[:64] for t in unique_texts],
+        metric = Metric.COSINE,
+        index  = Index.HNSW,
+    )
+    q_text = "semantic search with dense vectors"
+    q_vec  = embedder(q_text)
+    res    = db_d.search(q_vec, k=3)
+    print(f"\n    Query: {q_text!r}")
+    print_results(res, "Top-3 from dedup index")
+    db_d.save()
+    db_d.close()
+    dedup_cache.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Example 12: Transactions
+# ──────────────────────────────────────────────────────────────────────────────
+
+def example_transactions():
+    print("=" * 60)
+    print("Example 12: Transactions")
+    print("=" * 60)
+    print("  Atomic groups of INSERT / DELETE / UPDATE operations.\n")
+
+    dim  = 32
+    path = os.path.join(DB_DIR, "txn_demo.pst")
+    if os.path.exists(path):
+        os.remove(path)
+    db   = PistaDB(path, dim=dim, metric=Metric.L2, index=Index.LINEAR)
+    rng2 = np.random.default_rng(7)
+
+    def rand_vec():
+        return rng2.random(dim, dtype=np.float64).astype(np.float32)
+
+    # ── (A) Basic atomic batch insert ─────────────────────────────────────
+    print("  [A] Atomic batch insert (context-manager form)")
+    t0 = time.perf_counter()
+    with db.begin_transaction() as txn:
+        for i in range(1, 101):
+            txn.insert(i, rand_vec(), label=f"doc_{i}")
+    t_txn = time.perf_counter() - t0
+    print(f"    Committed 100 inserts atomically in {t_txn*1000:.1f} ms")
+    print(f"    count={db.count}")
+
+    # ── (B) Rollback on exception ──────────────────────────────────────────
+    print("\n  [B] Rollback on exception — count stays unchanged")
+    count_before = db.count
+    try:
+        with db.begin_transaction() as txn:
+            txn.insert(200, rand_vec(), label="new_doc")
+            txn.insert(201, rand_vec(), label="new_doc_2")
+            raise ValueError("simulated downstream failure")
+    except ValueError:
+        pass
+    count_after = db.count
+    print(f"    Before: {count_before}  After: {count_after}  "
+          f"({'unchanged' if count_before == count_after else 'CHANGED (bug!)'})")
+
+    # ── (C) Mixed: insert + delete + update atomically ────────────────────
+    print("\n  [C] Mixed transaction: insert 5, delete id=1, update id=2")
+    v_new = rand_vec()
+    with db.begin_transaction() as txn:
+        for i in range(101, 106):            # insert 5 more docs
+            txn.insert(i, rand_vec(), label=f"doc_{i}")
+        txn.delete(1)                         # remove id=1
+        txn.update(2, v_new)                  # replace id=2 vector
+
+    got_vec, _ = db.get(2)
+    print(f"    count={db.count}  (was 100, +5 inserts -1 delete = 104)")
+    print(f"    id=2 vector updated: {np.allclose(got_vec, v_new, atol=1e-5)}")
+    with_id1 = True
+    try:
+        db.get(1)
+    except RuntimeError:
+        with_id1 = False
+    print(f"    id=1 deleted: {not with_id1}")
+
+    # ── (D) Failed commit with automatic rollback ─────────────────────────
+    print("\n  [D] Commit failure with rollback")
+    count_before = db.count
+    try:
+        txn = db.begin_transaction()
+        txn.insert(999, rand_vec(), label="will_be_undone")   # succeeds in apply
+        txn.delete(9999)                                       # fails: id doesn't exist
+        txn.commit()
+    except RuntimeError as exc:
+        print(f"    Commit failed as expected: {exc}")
+        txn.free()
+    count_after = db.count
+    print(f"    id=999 rolled back: count {count_before} -> {count_after} "
+          f"({'OK' if count_before == count_after else 'rollback incomplete'})")
+
+    # ── (E) Manual form + reuse ────────────────────────────────────────────
+    print("\n  [E] Manual commit/rollback + handle reuse")
+    txn = db.begin_transaction()
+    txn.insert(500, rand_vec(), label="first_use")
+    print(f"    Staged {txn.op_count} op(s)")
+    txn.commit()
+    print(f"    After first commit: count={db.count}")
+    # Reuse the same handle
+    txn.insert(501, rand_vec(), label="second_use")
+    txn.commit()
+    txn.free()
+    print(f"    After second commit: count={db.count}")
+
+    # ── (F) Data integrity demo: atomic document index update ─────────────
+    print("\n  [F] Data integrity: atomic 'swap' of two document embeddings")
+    v_a = rand_vec()
+    v_b = rand_vec()
+    db.insert(1000, v_a, label="doc_A")
+    db.insert(1001, v_b, label="doc_B")
+
+    with db.begin_transaction() as txn:
+        txn.update(1000, v_b)   # swap A <- B's vector
+        txn.update(1001, v_a)   # swap B <- A's vector
+
+    got_1000, _ = db.get(1000)
+    got_1001, _ = db.get(1001)
+    print(f"    Swap verified: 1000 now has B's vec={np.allclose(got_1000, v_b, atol=1e-5)}"
+          f"  1001 now has A's vec={np.allclose(got_1001, v_a, atol=1e-5)}")
+
+    db.save()
+    db.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -369,6 +865,10 @@ if __name__ == "__main__":
     example_ivf()
     example_batch_api()
     example_diskann()
+    example_scann()
+    example_embedding_cache()
+    example_multithreaded_batch()
+    example_transactions()
 
     print("\n" + "="*60)
     print("All examples completed successfully!")

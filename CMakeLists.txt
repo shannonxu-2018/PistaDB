@@ -91,6 +91,7 @@ set(PISTADB_SOURCES
     src/pistadb.c
     src/pistadb_batch.c
     src/pistadb_cache.c
+    src/pistadb_txn.c
 )
 
 set(PISTADB_HEADERS
@@ -98,6 +99,7 @@ set(PISTADB_HEADERS
     src/pistadb.h
     src/pistadb_batch.h
     src/pistadb_cache.h
+    src/pistadb_txn.h
     src/distance.h
     src/distance_simd.h
     src/utils.h

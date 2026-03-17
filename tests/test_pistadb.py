@@ -18,7 +18,11 @@ import numpy as np
 # Add python package to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
-from pistadb import PistaDB, Metric, Index, Params, build_from_array
+from pistadb import (
+    PistaDB, Metric, Index, Params, build_from_array,
+    EmbeddingCache, CachedEmbedder, CacheStats,
+    Transaction, TXN_PARTIAL,
+)
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -495,6 +499,615 @@ class TestScaNN:
 
         recall = float(np.mean(recalls))
         assert recall >= 0.5, f"ScaNN recall@{K} = {recall:.2f} < 0.5"
+
+
+# ── EmbeddingCache tests ───────────────────────────────────────────────────────
+
+class TestEmbeddingCache:
+    """Tests for the EmbeddingCache (pistadb_cache_* API)."""
+
+    DIM = 32
+
+    @pytest.fixture
+    def cache_path(self, tmp_path):
+        return str(tmp_path / "embed.pcc")
+
+    @pytest.fixture
+    def cache(self, cache_path):
+        c = EmbeddingCache(cache_path, dim=self.DIM)
+        yield c
+        c.close()
+
+    @pytest.fixture
+    def vec(self):
+        rng = np.random.default_rng(1)
+        return rng.random(self.DIM, dtype=np.float32)
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────
+
+    def test_open_close(self, cache_path):
+        c = EmbeddingCache(cache_path, dim=self.DIM)
+        c.close()
+        c.close()  # idempotent
+
+    def test_context_manager(self, cache_path):
+        with EmbeddingCache(cache_path, dim=self.DIM) as c:
+            assert c._handle is not None
+        assert c._handle is None
+
+    def test_repr(self, cache):
+        r = repr(cache)
+        assert "EmbeddingCache" in r
+
+    # ── Put / Get ──────────────────────────────────────────────────────────
+
+    def test_miss_before_put(self, cache):
+        assert cache.get("never_inserted") is None
+
+    def test_put_and_get_roundtrip(self, cache, vec):
+        cache.put("hello", vec)
+        got = cache.get("hello")
+        assert got is not None
+        np.testing.assert_allclose(got, vec, atol=1e-6)
+
+    def test_get_returns_copy(self, cache, vec):
+        """Modifying the returned array must not corrupt the cached entry."""
+        cache.put("copy_test", vec)
+        got = cache.get("copy_test")
+        got[:] = 0.0
+        got2 = cache.get("copy_test")
+        np.testing.assert_allclose(got2, vec, atol=1e-6)
+
+    def test_put_updates_existing_entry(self, cache):
+        rng = np.random.default_rng(99)
+        v1 = rng.random(self.DIM, dtype=np.float32)
+        v2 = rng.random(self.DIM, dtype=np.float32)
+        cache.put("key", v1)
+        cache.put("key", v2)
+        got = cache.get("key")
+        np.testing.assert_allclose(got, v2, atol=1e-6)
+
+    def test_multiple_entries(self, cache):
+        rng = np.random.default_rng(7)
+        texts = [f"sentence_{i}" for i in range(10)]
+        vecs  = [rng.random(self.DIM, dtype=np.float32) for _ in texts]
+        for t, v in zip(texts, vecs):
+            cache.put(t, v)
+        for t, v in zip(texts, vecs):
+            got = cache.get(t)
+            assert got is not None, f"miss for {t!r}"
+            np.testing.assert_allclose(got, v, atol=1e-6)
+
+    def test_wrong_dim_raises(self, cache):
+        bad_vec = np.ones(self.DIM + 1, dtype=np.float32)
+        with pytest.raises(ValueError):
+            cache.put("bad", bad_vec)
+
+    # ── Contains ──────────────────────────────────────────────────────────
+
+    def test_contains_false_before_put(self, cache):
+        assert not cache.contains("absent")
+        assert "absent" not in cache
+
+    def test_contains_true_after_put(self, cache, vec):
+        cache.put("present", vec)
+        assert cache.contains("present")
+        assert "present" in cache
+
+    def test_contains_does_not_count_as_hit(self, cache, vec):
+        """contains() must not increment hit counter."""
+        cache.put("x", vec)
+        cache.contains("x")
+        stats = cache.stats()
+        assert stats.hits == 0
+
+    # ── Evict ─────────────────────────────────────────────────────────────
+
+    def test_evict_existing(self, cache, vec):
+        cache.put("evictme", vec)
+        assert cache.evict("evictme") is True
+        assert cache.get("evictme") is None
+
+    def test_evict_absent(self, cache):
+        assert cache.evict("does_not_exist") is False
+
+    def test_evict_reduces_count(self, cache, vec):
+        cache.put("a", vec)
+        cache.put("b", vec)
+        cache.evict("a")
+        assert cache.count == 1
+
+    # ── Clear ─────────────────────────────────────────────────────────────
+
+    def test_clear_empties_cache(self, cache, vec):
+        for i in range(5):
+            cache.put(f"item_{i}", vec)
+        cache.clear()
+        assert cache.count == 0
+        assert len(cache) == 0
+        assert cache.get("item_0") is None
+
+    # ── Stats ─────────────────────────────────────────────────────────────
+
+    def test_stats_initial(self, cache):
+        s = cache.stats()
+        assert isinstance(s, CacheStats)
+        assert s.hits == 0
+        assert s.misses == 0
+        assert s.evictions == 0
+        assert s.count == 0
+
+    def test_stats_hit_miss_counts(self, cache, vec):
+        cache.put("word", vec)
+        cache.get("word")        # hit
+        cache.get("missing1")    # miss
+        cache.get("missing2")    # miss
+        s = cache.stats()
+        assert s.hits   == 1
+        assert s.misses == 2
+
+    def test_stats_hit_rate(self, cache, vec):
+        cache.put("w", vec)
+        cache.get("w")    # hit
+        cache.get("w")    # hit
+        cache.get("nope") # miss
+        assert abs(cache.stats().hit_rate - 2/3) < 1e-6
+
+    def test_stats_count_matches_len(self, cache, vec):
+        cache.put("a", vec)
+        cache.put("b", vec)
+        s = cache.stats()
+        assert s.count == cache.count == len(cache) == 2
+
+    def test_stats_max_entries(self, cache_path):
+        with EmbeddingCache(cache_path, dim=self.DIM, max_entries=50) as c:
+            s = c.stats()
+        assert s.max_entries == 50
+
+    # ── LRU eviction at capacity ───────────────────────────────────────────
+
+    def test_lru_capacity_respected(self, cache_path):
+        cap = 5
+        rng = np.random.default_rng(3)
+        with EmbeddingCache(cache_path, dim=self.DIM, max_entries=cap) as c:
+            for i in range(cap + 3):
+                c.put(f"entry_{i}", rng.random(self.DIM, dtype=np.float32))
+            assert c.count <= cap
+            s = c.stats()
+        assert s.evictions > 0
+
+    def test_lru_mru_entry_survives(self, cache_path):
+        """The most-recently-used entry must survive an eviction cycle."""
+        cap = 3
+        rng = np.random.default_rng(5)
+        vecs = [rng.random(self.DIM, dtype=np.float32) for _ in range(cap + 2)]
+        with EmbeddingCache(cache_path, dim=self.DIM, max_entries=cap) as c:
+            for i in range(cap):
+                c.put(f"k{i}", vecs[i])
+            # Access k0 to make it MRU; k1 becomes LRU
+            c.get("k0")
+            # Add two more — k1 and k2 should be evicted first
+            c.put(f"k{cap}",   vecs[cap])
+            c.put(f"k{cap+1}", vecs[cap+1])
+            # k0 (MRU before overflow) should still be present
+            assert c.get("k0") is not None
+
+    # ── Persistence ───────────────────────────────────────────────────────
+
+    def test_save_and_reload(self, cache_path):
+        rng = np.random.default_rng(11)
+        vecs = {f"text_{i}": rng.random(self.DIM, dtype=np.float32) for i in range(10)}
+
+        with EmbeddingCache(cache_path, dim=self.DIM) as c:
+            for t, v in vecs.items():
+                c.put(t, v)
+            c.save()
+
+        with EmbeddingCache(cache_path, dim=self.DIM) as c2:
+            assert c2.count == len(vecs)
+            for t, v in vecs.items():
+                got = c2.get(t)
+                assert got is not None, f"text {t!r} missing after reload"
+                np.testing.assert_allclose(got, v, atol=1e-6)
+
+    def test_file_magic(self, cache_path):
+        """Saved .pcc file must start with 'PCCH'."""
+        with EmbeddingCache(cache_path, dim=self.DIM) as c:
+            c.put("x", np.ones(self.DIM, dtype=np.float32))
+            c.save()
+        with open(cache_path, "rb") as f:
+            magic = f.read(4)
+        assert magic == b"PCCH"
+
+    def test_reload_preserves_stats(self, cache_path):
+        """Cumulative hit/miss/eviction counters must survive a save/reload."""
+        rng = np.random.default_rng(22)
+        v = rng.random(self.DIM, dtype=np.float32)
+
+        with EmbeddingCache(cache_path, dim=self.DIM) as c:
+            c.put("a", v)
+            c.get("a")     # 1 hit
+            c.get("miss")  # 1 miss
+            c.save()
+
+        with EmbeddingCache(cache_path, dim=self.DIM) as c2:
+            s = c2.stats()
+        assert s.hits   == 1
+        assert s.misses == 1
+
+    def test_reload_partial_capacity(self, cache_path):
+        """When reloaded with a smaller max_entries, excess entries are dropped."""
+        rng = np.random.default_rng(33)
+        n = 10
+        with EmbeddingCache(cache_path, dim=self.DIM) as c:
+            for i in range(n):
+                c.put(f"t{i}", rng.random(self.DIM, dtype=np.float32))
+            c.save()
+
+        cap = 4
+        with EmbeddingCache(cache_path, dim=self.DIM, max_entries=cap) as c2:
+            assert c2.count <= cap
+
+    def test_no_save_means_no_file(self, tmp_path):
+        """Closing without save must not create the .pcc file."""
+        path = str(tmp_path / "nosave.pcc")
+        with EmbeddingCache(path, dim=self.DIM) as c:
+            c.put("x", np.ones(self.DIM, dtype=np.float32))
+        # File should NOT exist because save() was never called
+        assert not os.path.exists(path)
+
+
+# ── CachedEmbedder tests ───────────────────────────────────────────────────────
+
+class TestCachedEmbedder:
+    """Tests for CachedEmbedder (the transparent caching wrapper)."""
+
+    DIM = 16
+
+    @pytest.fixture
+    def _make_embedder(self, tmp_path):
+        """Factory: returns (embedder, cache, call_log)."""
+        call_log = []
+        def fake_model(text: str) -> np.ndarray:
+            call_log.append(text)
+            # Deterministic but unique vector per text
+            seed = sum(ord(c) for c in text)
+            return np.random.default_rng(seed).random(self.DIM, dtype=np.float32)
+
+        cache    = EmbeddingCache(str(tmp_path / "e.pcc"), dim=self.DIM)
+        embedder = CachedEmbedder(fake_model, cache)
+        return embedder, cache, call_log
+
+    def test_miss_calls_model(self, _make_embedder):
+        embedder, cache, log = _make_embedder
+        embedder("hello")
+        assert "hello" in log
+
+    def test_hit_skips_model(self, _make_embedder):
+        embedder, cache, log = _make_embedder
+        embedder("hello")
+        assert len(log) == 1
+        embedder("hello")   # second call — must be a cache hit
+        assert len(log) == 1, "model should not be called on cache hit"
+
+    def test_result_is_consistent(self, _make_embedder):
+        embedder, _, _ = _make_embedder
+        v1 = embedder("consistent")
+        v2 = embedder("consistent")
+        np.testing.assert_array_equal(v1, v2)
+
+    def test_different_texts_different_vectors(self, _make_embedder):
+        embedder, _, _ = _make_embedder
+        v1 = embedder("alpha")
+        v2 = embedder("beta")
+        assert not np.allclose(v1, v2)
+
+    def test_cache_property(self, _make_embedder):
+        embedder, cache, _ = _make_embedder
+        assert embedder.cache is cache
+
+    def test_embed_batch_shape(self, _make_embedder):
+        embedder, _, _ = _make_embedder
+        texts  = ["one", "two", "three"]
+        result = embedder.embed_batch(texts)
+        assert result.shape == (3, self.DIM)
+        assert result.dtype == np.float32
+
+    def test_embed_batch_uses_cache(self, _make_embedder):
+        embedder, _, log = _make_embedder
+        texts = ["cat", "dog", "cat"]   # "cat" appears twice
+        embedder.embed_batch(texts)
+        assert log.count("cat") == 1, "duplicate text in batch should hit cache on second occurrence"
+
+    def test_autosave_triggers(self, tmp_path):
+        """After autosave_every new embeddings the file must exist on disk."""
+        call_log = []
+        def fake_model(text):
+            call_log.append(text)
+            return np.ones(self.DIM, dtype=np.float32)
+
+        path  = str(tmp_path / "autosave.pcc")
+        cache = EmbeddingCache(path, dim=self.DIM)
+        embedder = CachedEmbedder(fake_model, cache, autosave_every=3)
+
+        for i in range(3):
+            embedder(f"item_{i}")
+
+        assert os.path.exists(path), ".pcc file should exist after autosave_every items"
+        cache.close()
+
+    def test_autosave_zero_means_never(self, tmp_path):
+        """autosave_every=0 should never write the file automatically."""
+        def fake_model(text):
+            return np.ones(self.DIM, dtype=np.float32)
+
+        path  = str(tmp_path / "no_autosave.pcc")
+        cache = EmbeddingCache(path, dim=self.DIM)
+        embedder = CachedEmbedder(fake_model, cache, autosave_every=0)
+
+        for i in range(10):
+            embedder(f"item_{i}")
+
+        assert not os.path.exists(path), ".pcc file must not exist without explicit save()"
+        cache.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Transaction tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTransaction:
+    """Tests for PistaDB.begin_transaction() / Transaction API."""
+
+    DIM = 16
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        """Fresh LINEAR database (LINEAR supports pistadb_get for all ops)."""
+        d = PistaDB(str(tmp_path / "txn.pst"), dim=self.DIM,
+                    metric=Metric.L2, index=Index.LINEAR)
+        yield d
+        d.close()
+
+    @pytest.fixture
+    def db_hnsw(self, tmp_path):
+        """Fresh HNSW database (HNSW now supports pistadb_get)."""
+        d = PistaDB(str(tmp_path / "txn_hnsw.pst"), dim=self.DIM,
+                    metric=Metric.L2, index=Index.HNSW)
+        yield d
+        d.close()
+
+    @pytest.fixture
+    def rng(self):
+        return np.random.default_rng(0)
+
+    def _vec(self, rng=None, seed=None):
+        r = rng if rng is not None else np.random.default_rng(seed or 0)
+        return r.random(self.DIM, dtype=np.float64).astype(np.float32)
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────
+
+    def test_begin_free(self, db):
+        txn = db.begin_transaction()
+        assert isinstance(txn, Transaction)
+        txn.free()
+
+    def test_repr(self, db):
+        txn = db.begin_transaction()
+        assert "Transaction" in repr(txn)
+        txn.free()
+
+    def test_op_count_empty(self, db):
+        txn = db.begin_transaction()
+        assert txn.op_count == 0
+        txn.free()
+
+    def test_op_count_after_staging(self, db, rng):
+        txn = db.begin_transaction()
+        txn.insert(1, self._vec(rng))
+        txn.insert(2, self._vec(rng))
+        assert txn.op_count == 2
+        txn.free()
+
+    def test_commit_empty_is_noop(self, db):
+        txn = db.begin_transaction()
+        txn.commit()   # should not raise
+        assert db.count == 0
+
+    # ── Insert ─────────────────────────────────────────────────────────────
+
+    def test_insert_commit(self, db, rng):
+        with db.begin_transaction() as txn:
+            txn.insert(1, self._vec(rng), label="a")
+            txn.insert(2, self._vec(rng), label="b")
+        assert db.count == 2
+
+    def test_insert_visible_after_commit(self, db, rng):
+        v = self._vec(rng)
+        with db.begin_transaction() as txn:
+            txn.insert(99, v, label="dog")
+        got_vec, got_lbl = db.get(99)
+        assert np.allclose(got_vec, v, atol=1e-5)
+        assert got_lbl == "dog"
+
+    def test_insert_not_visible_before_commit(self, db, rng):
+        """Staging an insert must not modify the live index."""
+        txn = db.begin_transaction()
+        txn.insert(1, self._vec(rng))
+        assert db.count == 0  # not yet committed
+        txn.rollback()
+        txn.free()
+
+    def test_rollback_discards_staged_inserts(self, db, rng):
+        txn = db.begin_transaction()
+        txn.insert(1, self._vec(rng))
+        txn.rollback()
+        txn.free()
+        assert db.count == 0
+
+    def test_multiple_inserts_atomic(self, db, rng):
+        vecs = [self._vec(rng) for _ in range(10)]
+        with db.begin_transaction() as txn:
+            for i, v in enumerate(vecs, start=1):
+                txn.insert(i, v)
+        assert db.count == 10
+
+    def test_duplicate_insert_id_validation_fails(self, db, rng):
+        """Duplicate INSERT ids in one transaction must raise before applying."""
+        v = self._vec(rng)
+        with pytest.raises(RuntimeError):
+            with db.begin_transaction() as txn:
+                txn.insert(1, v)
+                txn.insert(1, v)   # duplicate → commit raises
+        # No inserts should have been applied.
+        assert db.count == 0
+
+    # ── Delete ─────────────────────────────────────────────────────────────
+
+    def test_delete_commit(self, db, rng):
+        db.insert(1, self._vec(rng))
+        assert db.count == 1
+        with db.begin_transaction() as txn:
+            txn.delete(1)
+        assert db.count == 0
+
+    def test_delete_rollback_restores(self, db, rng):
+        db.insert(1, self._vec(rng))
+        txn = db.begin_transaction()
+        txn.delete(1)
+        txn.rollback()
+        txn.free()
+        assert db.count == 1  # delete was not applied
+
+    # ── Update ─────────────────────────────────────────────────────────────
+
+    def test_update_commit(self, db, rng):
+        v1 = self._vec(rng)
+        v2 = self._vec(rng)
+        db.insert(1, v1)
+        with db.begin_transaction() as txn:
+            txn.update(1, v2)
+        got, _ = db.get(1)
+        assert np.allclose(got, v2, atol=1e-5)
+
+    def test_update_rollback_leaves_original(self, db, rng):
+        v1 = self._vec(rng)
+        v2 = self._vec(rng)
+        db.insert(1, v1)
+        txn = db.begin_transaction()
+        txn.update(1, v2)
+        txn.rollback()
+        txn.free()
+        got, _ = db.get(1)
+        assert np.allclose(got, v1, atol=1e-5)
+
+    # ── Mixed operations ────────────────────────────────────────────────────
+
+    def test_mixed_insert_delete_commit(self, db, rng):
+        db.insert(10, self._vec(rng))
+        with db.begin_transaction() as txn:
+            txn.insert(1, self._vec(rng))
+            txn.insert(2, self._vec(rng))
+            txn.delete(10)
+        assert db.count == 2
+        with pytest.raises(RuntimeError):
+            db.get(10)   # should be gone
+
+    def test_insert_then_update_in_same_txn(self, db, rng):
+        v1 = self._vec(rng)
+        v2 = self._vec(rng)
+        # Insert id=1 outside the txn, then update it within the txn
+        db.insert(1, v1)
+        with db.begin_transaction() as txn:
+            txn.insert(2, v2)
+            txn.update(1, v2)
+        got1, _ = db.get(1)
+        assert np.allclose(got1, v2, atol=1e-5)
+        assert db.count == 2
+
+    # ── Context manager semantics ───────────────────────────────────────────
+
+    def test_context_manager_commits_on_success(self, db, rng):
+        with db.begin_transaction() as txn:
+            txn.insert(1, self._vec(rng))
+        assert db.count == 1
+
+    def test_context_manager_rollback_on_exception(self, db, rng):
+        try:
+            with db.begin_transaction() as txn:
+                txn.insert(1, self._vec(rng))
+                raise ValueError("simulated failure")
+        except ValueError:
+            pass
+        assert db.count == 0  # insert was rolled back
+
+    # ── Rollback on failed apply ────────────────────────────────────────────
+
+    def test_commit_rollback_on_apply_failure(self, db, rng):
+        """If the second op of a commit fails, the first should be undone."""
+        db.insert(1, self._vec(rng))  # pre-existing vector
+
+        txn = db.begin_transaction()
+        txn.insert(2, self._vec(rng))   # will succeed
+        txn.delete(999)                  # will fail (id=999 does not exist)
+        with pytest.raises(RuntimeError):
+            txn.commit()
+        txn.free()
+
+        # id=2 insert should have been rolled back by undo
+        assert db.count == 1   # only the pre-existing id=1 remains
+
+    # ── Handle reuse after commit ───────────────────────────────────────────
+
+    def test_reuse_after_commit(self, db, rng):
+        txn = db.begin_transaction()
+        txn.insert(1, self._vec(rng))
+        txn.commit()
+        # Stage a second transaction on the same handle
+        txn.insert(2, self._vec(rng))
+        txn.commit()
+        txn.free()
+        assert db.count == 2
+
+    # ── HNSW get() support (pistadb_get extended for HNSW) ─────────────────
+
+    def test_hnsw_delete_undo(self, db_hnsw, rng):
+        """pistadb_get() now works for HNSW so DELETE undo should succeed."""
+        v = self._vec(rng)
+        db_hnsw.insert(1, v, label="item")
+        txn = db_hnsw.begin_transaction()
+        txn.insert(2, self._vec(rng))  # will succeed
+        txn.delete(999)                # id=999 does not exist → will fail on commit
+        with pytest.raises(RuntimeError):
+            txn.commit()
+        txn.free()
+        # id=2 insert should be rolled back
+        assert db_hnsw.count == 1
+
+    def test_hnsw_get_works(self, db_hnsw, rng):
+        """Verify the extended pistadb_get() returns correct data for HNSW."""
+        v = self._vec(rng)
+        db_hnsw.insert(42, v, label="hnsw_item")
+        got_vec, got_lbl = db_hnsw.get(42)
+        assert np.allclose(got_vec, v, atol=1e-5)
+        assert got_lbl == "hnsw_item"
+
+    # ── Search after commit ─────────────────────────────────────────────────
+
+    def test_committed_data_is_searchable(self, db, rng):
+        query = np.zeros(self.DIM, dtype=np.float32)
+        # Insert a vector very close to the zero query
+        near = np.full(self.DIM, 0.001, dtype=np.float32)
+        # Insert a vector far from the zero query
+        far  = np.full(self.DIM, 100.0, dtype=np.float32)
+
+        with db.begin_transaction() as txn:
+            txn.insert(1, near, label="near")
+            txn.insert(2, far,  label="far")
+
+        results = db.search(query, k=1)
+        assert len(results) == 1
+        assert results[0].label == "near"
 
 
 if __name__ == "__main__":
