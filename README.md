@@ -32,6 +32,55 @@ RAG-ready · Zero dependencies · Single-file storage · MIT Licensed</p>
 
 ---
 
+## 🆕 What's New
+
+### Chunked Vector Storage — No Scale Ceiling
+
+All seven index types now use **VecStore**, a chunked storage layer that replaces the single contiguous heap allocation used for raw float vectors and labels.
+
+| | Before | After (VecStore) |
+|---|---|---|
+| Storage layout | One `realloc()` growing to tens of GB | 131,072-entry chunks, 64 MB max single alloc |
+| OOM boundary | ~9.4 M vectors on Windows (heap fragmented by graph nodes) | **None** — chunks allocated independently |
+| Max single allocation | ≈10 GB contiguous block | 64 MB (one chunk at dim=128) |
+| Access cost | O(1) pointer arithmetic | O(1) bit-shift + masked index |
+
+The chunking is transparent — all public APIs, the `.pst` file format, and all language bindings are unchanged.
+
+### Verified at 10 M Vectors (HNSW)
+
+HNSW successfully inserted **10,000,000 vectors** (`dim=128`, `M=8`, `ef_construction=50`) on Windows AMD64 with no OOM error.
+
+| Cumulative | Elapsed | Throughput |
+|---|---|---|
+| 500,000 | 94s | 5,314 vec/s |
+| 1,000,000 | 3m 47s | 4,404 vec/s |
+| 5,000,000 | 24m 53s | 3,348 vec/s |
+| **10,000,000** | **1h 22m** | **2,030 vec/s** |
+
+HNSW throughput declines logarithmically with N — a fundamental property of the graph algorithm — while delivering **sub-millisecond approximate k-NN** search at any scale.
+
+### Full CRUD at 9 M Records (IVF)
+
+| Operation | Records | Time | Throughput |
+|---|---|---|---|
+| **INSERT** | 9,000,000 | 2m 34s | **58,381 vec/s** |
+| **SEARCH** k=10 | 200 queries | — | p50=**316 ms** · p95=381 ms · QPS=3 |
+| **UPDATE** | 100,000 | 6m 1s | **277 ops/s** |
+| **DELETE** | 100,000 | 6m 6s | **273 ops/s** |
+
+Configuration: `nlist=500`, `nprobe=50`, `dim=128`, Windows AMD64, 69 GB RAM.
+
+### Complete Production Feature Set
+
+- **Transactions** — ACID-style atomic multi-op groups with full undo-on-failure rollback
+- **Android** — Java + Kotlin API via JNI (`android/`), all 4 ABIs (arm64, armeabi-v7a, x86_64, x86)
+- **iOS / macOS** — Objective-C + Swift via Swift Package Manager (`ios/`, `Package.swift`)
+- **9 language bindings** — C, C++, Python, Go, Java, Kotlin, Swift, Objective-C, C#, Rust, WASM
+- **109 / 109 tests passing** across all features and platforms
+
+---
+
 ## ✨ Why PistaDB?
 
 | | PistaDB | Cloud / Server Vector DB |
@@ -1441,6 +1490,65 @@ with PistaDB("mydb.pst", dim=dim, metric=Metric.COSINE, index=Index.HNSW) as db:
 
 ---
 
+## 📊 Large-Scale CRUD Benchmark (for performance of data in the tens of millions)
+
+Benchmarked on **9,000,000 records** · `dim=128` · L2 metric · Windows AMD64 · Python 3.13 · 69 GB RAM.
+
+Full benchmark script: [`benchmarks/benchmark_10m.py`](benchmarks/benchmark_10m.py)
+
+---
+
+### IVF Index — Complete CRUD at 9 M Records
+
+Configuration: `nlist=500`, `nprobe=50` (10% of clusters probed per query), 10 K training vectors.
+
+| Operation | Records | Time | Throughput |
+|-----------|---------|------|-----------|
+| **INSERT** (post-train) | 9,000,000 | 2m 26s | **61,494 vec/s** |
+| **SEARCH** k=10 | 200 queries | — | p50=**222 ms** · p95=245 ms · p99=258 ms · QPS=4 |
+| **UPDATE** | 100,000 | 4m 35s | **363 ops/s** |
+| **DELETE** | 100,000 | 6m 10s | **270 ops/s** |
+
+**INSERT milestone breakdown:**
+
+| Cumulative records | Elapsed | Throughput |
+|--------------------|---------|-----------|
+| 1,000,000 | 16.67 s | 59,989 vec/s |
+| 2,000,000 | 33.14 s | 60,355 vec/s |
+| 3,000,000 | 49.85 s | 60,176 vec/s |
+| 4,000,000 | 1m 06s | 60,120 vec/s |
+| 5,000,000 | 1m 23s | 59,737 vec/s |
+| 6,000,000 | 1m 40s | 59,938 vec/s |
+| 7,000,000 | 1m 56s | 60,016 vec/s |
+| 8,000,000 | 2m 12s | 60,387 vec/s |
+| 9,000,000 | 2m 26s | 61,494 vec/s |
+
+> **Notes:** IVF insert is O(1) — each vector is simply assigned to its nearest centroid, so throughput is nearly flat across all scales. Search latency at `nprobe=50` reflects scanning 50 clusters × ~18 K vectors each (≈ 900 K distance computations per query at 9 M scale); reduce `nprobe` for lower latency with marginally less recall. UPDATE and DELETE perform an O(N) id-scan to locate the target record; workloads with heavy mutations benefit more from HNSW which uses lazy deletion without a full-table scan.
+
+---
+
+### HNSW Index — INSERT Throughput at Scale
+
+Configuration: `M=8`, `ef_construction=50`, `ef_search=32` · dim=128 · L2.
+
+| Cumulative records | Elapsed | Throughput |
+|--------------------|---------|-----------|
+| 1,000,000 | 2m 54s | 5,741 vec/s |
+| 2,000,000 | 7m 20s | 4,540 vec/s |
+| 3,000,000 | 11m 27s | 4,362 vec/s |
+| 4,000,000 | 15m 49s | 4,212 vec/s |
+| 5,000,000 | 21m 54s | 3,805 vec/s |
+| 6,000,000 | 32m 02s | 3,122 vec/s |
+| 7,000,000 | 44m 00s | 2,651 vec/s |
+| 8,000,000 | 56m 03s | 2,378 vec/s |
+| 9,000,000 | 1h 08m | 2,196 vec/s |
+
+HNSW insert cost grows logarithmically with N (each insert traverses the graph with O(M·log N) distance computations), which explains the gradual throughput decline. In return, HNSW delivers **sub-millisecond approximate k-NN search** — independent of dataset size — which IVF cannot match at large `nlist` values.
+
+> **10 M capacity:** The old single-contiguous-block layout hit an OOM boundary at ~9.4 M vectors on Windows (the next capacity doubling required a ~10 GB contiguous `realloc()`). This has been resolved: all index types now use **VecStore chunked storage** — maximum single allocation is 64 MB regardless of dataset size. HNSW has been verified at 10,000,000 vectors on Windows AMD64 (see the *What's New* section above).
+
+---
+
 ## 🧪 Running Tests
 
 ```bash
@@ -1603,27 +1711,10 @@ PistaDB/
 
 ## 🗺️ Roadmap
 
-**Core engine**
-- [x] SIMD-accelerated distance kernels (AVX2 / NEON) for faster embedding comparisons
 - [ ] Filtered search with metadata predicates (filter by source, date, tag before ANN)
-- [x] Multi-threaded batch insert for high-throughput embedding pipelines
-
-**LLM & RAG ecosystem**
 - [ ] LangChain and LlamaIndex integration (drop-in vectorstore)
-- [ ] First-class support for OpenAI, Cohere, and sentence-transformers embedding dimensions
 - [ ] Hybrid search: dense vector + sparse BM25 re-ranking in a single query
-- [x] Embedding cache layer — deduplicate identical inputs automatically
-- [x] Transactions — atomic multi-operation groups with undo-on-failure rollback
-
-**Portability**
-- [x] Android bindings — Java + Kotlin via JNI (`android/`)
-- [x] iOS / macOS bindings — Objective-C + Swift via SPM (`ios/`, `Package.swift`)
-- [x] C# / .NET binding — P/Invoke, `IDisposable`, async/await (`csharp/`)
-- [x] Rust binding — FFI, `Send + Sync`, `Drop`, `Result<T, Error>` (`rust/`)
-- [x] C++ binding — header-only C++17, RAII, move-only, `std::mutex` (`cpp/pistadb.hpp`)
-- [x] Go binding — CGO, idiomatic Go types, GC finalizers, batch + cache APIs (`go/`)
-- [x] WASM build — Emscripten + Embind, ESM module, `Float32Array`, TypeScript types (`wasm/`)
-- [ ] WASM build — run full RAG pipelines in the browser
+- [ ] Full in-browser RAG pipeline via WASM (IDBFS persistence, SharedArrayBuffer workers)
 - [ ] HTTP microserver mode (optional, single binary, for multi-process access)
 
 ---

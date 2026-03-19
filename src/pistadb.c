@@ -330,9 +330,8 @@ int pistadb_get(PistaDB *db, uint64_t id, float *out_vec, char *out_label) {
     if (db->index_type == INDEX_LINEAR) {
         int slot = linear_find_id(&db->idx.linear, id);
         if (slot < 0) return PISTADB_ENOTFOUND;
-        if (out_vec) memcpy(out_vec, db->idx.linear.vectors + (size_t)slot * db->dim,
-                            sizeof(float) * (size_t)db->dim);
-        if (out_label) { strncpy(out_label, db->idx.linear.labels[slot], 255); out_label[255] = '\0'; }
+        if (out_vec) memcpy(out_vec, VS_VEC(&db->idx.linear.vs, slot), sizeof(float) * (size_t)db->dim);
+        if (out_label) { strncpy(out_label, VS_LABEL(&db->idx.linear.vs, slot), 255); out_label[255] = '\0'; }
         return PISTADB_OK;
     }
     /* For other indices, a generic "get" would require a linear scan of their internal stores.
@@ -341,9 +340,8 @@ int pistadb_get(PistaDB *db, uint64_t id, float *out_vec, char *out_label) {
         IVFIndex *iv = &db->idx.ivf;
         for (int i = 0; i < iv->n_vecs; i++) {
             if (iv->vec_ids[i] == id && !iv->vec_deleted[i]) {
-                if (out_vec) memcpy(out_vec, iv->vectors + (size_t)i * db->dim,
-                                    sizeof(float) * (size_t)db->dim);
-                if (out_label) { strncpy(out_label, iv->vec_labels[i], 255); out_label[255] = '\0'; }
+                if (out_vec) memcpy(out_vec, VS_VEC(&iv->vs, i), sizeof(float) * (size_t)db->dim);
+                if (out_label) { strncpy(out_label, VS_LABEL(&iv->vs, i), 255); out_label[255] = '\0'; }
                 return PISTADB_OK;
             }
         }
@@ -352,9 +350,8 @@ int pistadb_get(PistaDB *db, uint64_t id, float *out_vec, char *out_label) {
         LSHIndex *ls = &db->idx.lsh;
         for (int i = 0; i < ls->n_vecs; i++) {
             if (ls->vec_ids[i] == id && !ls->vec_deleted[i]) {
-                if (out_vec) memcpy(out_vec, ls->vectors + (size_t)i * db->dim,
-                                    sizeof(float) * (size_t)db->dim);
-                if (out_label) { strncpy(out_label, ls->vec_labels[i], 255); out_label[255] = '\0'; }
+                if (out_vec) memcpy(out_vec, VS_VEC(&ls->vs, i), sizeof(float) * (size_t)db->dim);
+                if (out_label) { strncpy(out_label, VS_LABEL(&ls->vs, i), 255); out_label[255] = '\0'; }
                 return PISTADB_OK;
             }
         }
@@ -363,9 +360,8 @@ int pistadb_get(PistaDB *db, uint64_t id, float *out_vec, char *out_label) {
         HNSWIndex *h = &db->idx.hnsw;
         for (int i = 0; i < h->n_nodes; i++) {
             if (h->nodes[i].vec_id == id && h->nodes[i].vec_id != UINT64_MAX) {
-                if (out_vec) memcpy(out_vec, h->vectors + (size_t)i * db->dim,
-                                    sizeof(float) * (size_t)db->dim);
-                if (out_label) { strncpy(out_label, h->labels[i], 255); out_label[255] = '\0'; }
+                if (out_vec) memcpy(out_vec, VS_VEC(&h->vs, i), sizeof(float) * (size_t)db->dim);
+                if (out_label) { strncpy(out_label, VS_LABEL(&h->vs, i), 255); out_label[255] = '\0'; }
                 return PISTADB_OK;
             }
         }
@@ -374,9 +370,8 @@ int pistadb_get(PistaDB *db, uint64_t id, float *out_vec, char *out_label) {
         DiskANNIndex *d = &db->idx.diskann;
         for (int i = 0; i < d->n_nodes; i++) {
             if (d->nodes[i].vec_id == id && !d->nodes[i].deleted) {
-                if (out_vec) memcpy(out_vec, d->vectors + (size_t)i * db->dim,
-                                    sizeof(float) * (size_t)db->dim);
-                if (out_label) { strncpy(out_label, d->labels[i], 255); out_label[255] = '\0'; }
+                if (out_vec) memcpy(out_vec, VS_VEC(&d->vs, i), sizeof(float) * (size_t)db->dim);
+                if (out_label) { strncpy(out_label, VS_LABEL(&d->vs, i), 255); out_label[255] = '\0'; }
                 return PISTADB_OK;
             }
         }
@@ -427,7 +422,7 @@ int pistadb_train(PistaDB *db) {
             IVFIndex *iv = &db->idx.ivf;
             /* Train on currently stored vectors */
             if (iv->n_vecs == 0) return PISTADB_EINVAL;
-            r = ivf_train(iv, iv->vectors, iv->n_vecs, 100);
+            r = ivf_train(iv, VS_VEC(&iv->vs, 0), iv->n_vecs, 100);
             break;
         }
         case INDEX_IVF_PQ: {

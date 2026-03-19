@@ -19,6 +19,7 @@
 #define PISTADB_INDEX_LSH_H
 
 #include "pistadb_types.h"
+#include "vec_store.h"
 #include "distance.h"
 #include <stdint.h>
 
@@ -48,9 +49,8 @@ typedef struct {
     float     w;
 
     /* All vectors for exact re-ranking */
-    float    *vectors;
+    VecStore  vs;              /* chunked vector + label storage */
     uint64_t *vec_ids;
-    char    (*vec_labels)[256];
     uint8_t  *vec_deleted;
     int       n_vecs;
     int       vec_cap;

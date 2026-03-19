@@ -15,6 +15,7 @@
 #define PISTADB_INDEX_HNSW_H
 
 #include "pistadb_types.h"
+#include "vec_store.h"
 #include "distance.h"
 #include <stdint.h>
 
@@ -36,8 +37,7 @@ typedef struct {
     int       node_cap;
 
     /* Floating vector data (owned by this index) */
-    float    *vectors;         /* [node_cap × dim] flat             */
-    char    (*labels)[256];    /* [node_cap] parallel label store   */
+    VecStore  vs;              /* chunked vector + label storage    */
 
     int       dim;
     DistFn    dist_fn;

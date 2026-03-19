@@ -36,39 +36,35 @@ int diskann_create(DiskANNIndex *idx, int dim, DistFn dist_fn,
     idx->medoid   = -1;
 
     idx->nodes   = (DiskANNNode *)calloc((size_t)idx->node_cap, sizeof(DiskANNNode));
-    idx->vectors = (float       *)malloc(sizeof(float) * (size_t)(idx->node_cap * dim));
-    idx->labels  = (char (*)[256])calloc((size_t)idx->node_cap, 256);
-    if (!idx->nodes || !idx->vectors || !idx->labels) return PISTADB_ENOMEM;
+    if (!idx->nodes) return PISTADB_ENOMEM;
+    if (vs_init(&idx->vs, dim, idx->node_cap) != PISTADB_OK) return PISTADB_ENOMEM;
     return PISTADB_OK;
 }
 
 void diskann_free(DiskANNIndex *idx) {
     for (int i = 0; i < idx->n_nodes; i++) free(idx->nodes[i].neighbors);
     free(idx->nodes);
-    free(idx->vectors);
-    free(idx->labels);
+    vs_free(&idx->vs);
     memset(idx, 0, sizeof(*idx));
 }
 
 static int da_grow(DiskANNIndex *idx) {
     int nc = idx->node_cap * 2 + 8;
-    DiskANNNode *nn  = (DiskANNNode *)realloc(idx->nodes,   sizeof(DiskANNNode) * (size_t)nc);
-    float       *nv  = (float       *)realloc(idx->vectors,  sizeof(float)       * (size_t)(nc * idx->dim));
-    char (*nl)[256]  = (char (*)[256])realloc(idx->labels,   256 * (size_t)nc);
-    if (!nn || !nv || !nl) return PISTADB_ENOMEM;
-    idx->labels = nl;
-    memset(nn + idx->node_cap, 0, sizeof(DiskANNNode) * (size_t)(nc - idx->node_cap));
-    memset((char *)nl + 256 * idx->node_cap, 0, 256 * (size_t)(nc - idx->node_cap));
-    idx->nodes = nn; idx->vectors = nv; idx->node_cap = nc;
+    DiskANNNode *nn = (DiskANNNode *)realloc(idx->nodes, sizeof(DiskANNNode) * (size_t)nc);
+    if (!nn) return PISTADB_ENOMEM;
+    idx->nodes = nn;
+    int r = vs_ensure(&idx->vs, nc);
+    if (r != PISTADB_OK) return r;
+    memset(idx->nodes + idx->node_cap, 0, sizeof(DiskANNNode) * (size_t)(nc - idx->node_cap));
+    idx->node_cap = nc;
     return PISTADB_OK;
 }
 
 static inline float node_dist_da(const DiskANNIndex *idx, int a, int b) {
-    return idx->dist_fn(idx->vectors + (size_t)a * idx->dim,
-                        idx->vectors + (size_t)b * idx->dim, idx->dim);
+    return idx->dist_fn(VS_VEC(&idx->vs, a), VS_VEC(&idx->vs, b), idx->dim);
 }
 static inline float query_dist_da(const DiskANNIndex *idx, const float *q, int n) {
-    return idx->dist_fn(q, idx->vectors + (size_t)n * idx->dim, idx->dim);
+    return idx->dist_fn(q, VS_VEC(&idx->vs, n), idx->dim);
 }
 
 /* ── Greedy search from medoid, return L nearest in 'result' heap ────────── */
@@ -185,9 +181,9 @@ int diskann_insert(DiskANNIndex *idx, uint64_t id, const char *label, const floa
     idx->nodes[p].neighbor_cap = idx->R + 4;
     idx->nodes[p].neighbors = (int *)malloc(sizeof(int) * (size_t)(idx->R + 4));
     if (!idx->nodes[p].neighbors) return PISTADB_ENOMEM;
-    memcpy(idx->vectors + (size_t)p * idx->dim, vec, sizeof(float) * (size_t)idx->dim);
-    if (label) { strncpy(idx->labels[p], label, 255); idx->labels[p][255] = '\0'; }
-    else        idx->labels[p][0] = '\0';
+    memcpy(VS_VEC(&idx->vs, p), vec, sizeof(float) * (size_t)idx->dim);
+    if (label) { strncpy(VS_LABEL(&idx->vs, p), label, 255); VS_LABEL(&idx->vs, p)[255] = '\0'; }
+    else        VS_LABEL(&idx->vs, p)[0] = '\0';
 
     if (p == 0) { idx->medoid = 0; return PISTADB_OK; }
 
@@ -254,7 +250,7 @@ int diskann_delete(DiskANNIndex *idx, uint64_t id) {
 int diskann_update(DiskANNIndex *idx, uint64_t id, const float *vec) {
     for (int i = 0; i < idx->n_nodes; i++) {
         if (idx->nodes[i].vec_id == id) {
-            memcpy(idx->vectors + (size_t)i * idx->dim, vec, sizeof(float) * (size_t)idx->dim);
+            memcpy(VS_VEC(&idx->vs, i), vec, sizeof(float) * (size_t)idx->dim);
             return PISTADB_OK;
         }
     }
@@ -272,7 +268,7 @@ int diskann_build(DiskANNIndex *idx) {
     int active = 0;
     for (int i = 0; i < idx->n_nodes; i++) {
         if (idx->nodes[i].deleted) continue;
-        const float *v = idx->vectors + (size_t)i * idx->dim;
+        const float *v = (const float *)VS_VEC(&idx->vs, i);
         for (int d = 0; d < idx->dim; d++) avg[d] += v[d];
         active++;
     }
@@ -281,7 +277,7 @@ int diskann_build(DiskANNIndex *idx) {
     float bd = FLT_MAX; int medoid = 0;
     for (int i = 0; i < idx->n_nodes; i++) {
         if (idx->nodes[i].deleted) continue;
-        float d = dist_l2sq(avg, idx->vectors + (size_t)i * idx->dim, idx->dim);
+        float d = dist_l2sq(avg, VS_VEC(&idx->vs, i), idx->dim);
         if (d < bd) { bd = d; medoid = i; }
     }
     free(avg);
@@ -304,7 +300,7 @@ int diskann_build(DiskANNIndex *idx) {
         int p = order[oi];
         if (idx->nodes[p].deleted) continue;
 
-        const float *vec = idx->vectors + (size_t)p * idx->dim;
+        const float *vec = (const float *)VS_VEC(&idx->vs, p);
         greedy_search(idx, vec, medoid, idx->L, &result, &visited);
 
         int total = result.size;
@@ -376,7 +372,7 @@ int diskann_search(DiskANNIndex *idx, const float *query, int k,
         if (idx->nodes[ns[i]].deleted) continue;
         results[cnt].id       = idx->nodes[ns[i]].vec_id;
         results[cnt].distance = ds[i];
-        strncpy(results[cnt].label, idx->labels[ns[i]], 255);
+        strncpy(results[cnt].label, VS_LABEL(&idx->vs, ns[i]), 255);
         results[cnt].label[255] = '\0';
         cnt++;
     }
@@ -415,8 +411,8 @@ int diskann_save(const DiskANNIndex *idx, void **out_buf, size_t *out_size) {
         WU64(idx->nodes[i].vec_id);
         WI32(idx->nodes[i].deleted);
         WI32(idx->nodes[i].neighbor_cnt);
-        memcpy(p, idx->labels[i], 256); p += 256;
-        memcpy(p, idx->vectors + (size_t)i * idx->dim, sizeof(float) * (size_t)idx->dim);
+        memcpy(p, VS_LABEL(&idx->vs, i), 256); p += 256;
+        memcpy(p, VS_VEC(&idx->vs, i), sizeof(float) * (size_t)idx->dim);
         p += sizeof(float) * (size_t)idx->dim;
         for (int j = 0; j < idx->nodes[i].neighbor_cnt; j++) WI32(idx->nodes[i].neighbors[j]);
     }
@@ -454,8 +450,8 @@ int diskann_load(DiskANNIndex *idx, const void *buf, size_t size,
         idx->nodes[i].neighbor_cnt = nc;
         idx->nodes[i].neighbor_cap = nc + 4;
         idx->nodes[i].neighbors = (int *)malloc(sizeof(int) * (size_t)(nc + 4));
-        memcpy(idx->labels[i], p, 256); p += 256;
-        memcpy(idx->vectors + (size_t)i * dim, p, sizeof(float) * (size_t)dim);
+        memcpy(VS_LABEL(&idx->vs, i), p, 256); p += 256;
+        memcpy(VS_VEC(&idx->vs, i), p, sizeof(float) * (size_t)dim);
         p += sizeof(float) * (size_t)dim;
         for (int j = 0; j < nc; j++) { idx->nodes[i].neighbors[j] = *(const int32_t*)p; p += 4; }
         idx->n_nodes++;

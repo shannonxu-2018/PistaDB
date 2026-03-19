@@ -105,13 +105,12 @@ int lsh_create(LSHIndex *idx, int dim, DistFn dist_fn, PistaDBMetric metric,
     idx->w        = w;
     idx->vec_cap  = 64;
 
-    idx->tables = (LSHTable *)calloc((size_t)L, sizeof(LSHTable));
-    idx->vectors   = (float    *)malloc(sizeof(float)    * (size_t)(idx->vec_cap * dim));
+    idx->tables    = (LSHTable *)calloc((size_t)L, sizeof(LSHTable));
     idx->vec_ids   = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)idx->vec_cap);
-    idx->vec_labels= (char (*)[256])malloc(256 * (size_t)idx->vec_cap);
     idx->vec_deleted=(uint8_t  *)calloc((size_t)idx->vec_cap, 1);
-    if (!idx->tables || !idx->vectors || !idx->vec_ids || !idx->vec_labels || !idx->vec_deleted)
+    if (!idx->tables || !idx->vec_ids || !idx->vec_deleted)
         return PISTADB_ENOMEM;
+    if (vs_init(&idx->vs, dim, idx->vec_cap) != PISTADB_OK) return PISTADB_ENOMEM;
 
     PCG rng; pcg_seed(&rng, 42);
     for (int l = 0; l < L; l++) {
@@ -124,7 +123,8 @@ int lsh_create(LSHIndex *idx, int dim, DistFn dist_fn, PistaDBMetric metric,
 void lsh_free(LSHIndex *idx) {
     for (int l = 0; l < idx->L; l++) table_free(&idx->tables[l]);
     free(idx->tables);
-    free(idx->vectors); free(idx->vec_ids); free(idx->vec_labels); free(idx->vec_deleted);
+    vs_free(&idx->vs);
+    free(idx->vec_ids); free(idx->vec_deleted);
     memset(idx, 0, sizeof(*idx));
 }
 
@@ -132,14 +132,14 @@ void lsh_free(LSHIndex *idx) {
 
 static int vec_store_grow_lsh(LSHIndex *idx) {
     int nc = idx->vec_cap * 2 + 8;
-    float    *nv = (float    *)realloc(idx->vectors,    sizeof(float)    * (size_t)(nc * idx->dim));
-    uint64_t *ni = (uint64_t *)realloc(idx->vec_ids,    sizeof(uint64_t) * (size_t)nc);
-    char     (*nl)[256] = (char (*)[256])realloc(idx->vec_labels, 256 * (size_t)nc);
-    uint8_t  *nd = (uint8_t  *)realloc(idx->vec_deleted,(size_t)nc);
-    if (!nv || !ni || !nl || !nd) return PISTADB_ENOMEM;
+    int r = vs_ensure(&idx->vs, nc);
+    if (r != PISTADB_OK) return r;
+    uint64_t *ni = (uint64_t *)realloc(idx->vec_ids,     sizeof(uint64_t) * (size_t)nc);
+    uint8_t  *nd = (uint8_t  *)realloc(idx->vec_deleted, (size_t)nc);
+    if (!ni || !nd) return PISTADB_ENOMEM;
     memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
-    idx->vectors=nv; idx->vec_ids=ni; idx->vec_labels=nl; idx->vec_deleted=nd;
-    idx->vec_cap=nc;
+    idx->vec_ids = ni; idx->vec_deleted = nd;
+    idx->vec_cap = nc;
     return PISTADB_OK;
 }
 
@@ -150,10 +150,10 @@ int lsh_insert(LSHIndex *idx, uint64_t id, const char *label, const float *vec) 
     int slot = idx->n_vecs++;
     idx->vec_ids[slot] = id;
     idx->vec_deleted[slot] = 0;
-    memcpy(idx->vectors + (size_t)slot * idx->dim, vec, sizeof(float) * (size_t)idx->dim);
-    if (label) strncpy(idx->vec_labels[slot], label, 255);
-    else        idx->vec_labels[slot][0] = '\0';
-    idx->vec_labels[slot][255] = '\0';
+    memcpy(VS_VEC(&idx->vs, slot), vec, sizeof(float) * (size_t)idx->dim);
+    if (label) strncpy(VS_LABEL(&idx->vs, slot), label, 255);
+    else        VS_LABEL(&idx->vs, slot)[0] = '\0';
+    VS_LABEL(&idx->vs, slot)[255] = '\0';
 
     for (int l = 0; l < idx->L; l++) {
         int r = table_insert(&idx->tables[l], vec, idx->dim, slot);
@@ -172,7 +172,7 @@ int lsh_delete(LSHIndex *idx, uint64_t id) {
 int lsh_update(LSHIndex *idx, uint64_t id, const float *vec) {
     for (int i = 0; i < idx->n_vecs; i++) {
         if (idx->vec_ids[i] == id && !idx->vec_deleted[i]) {
-            memcpy(idx->vectors + (size_t)i * idx->dim, vec, sizeof(float) * (size_t)idx->dim);
+            memcpy(VS_VEC(&idx->vs, i), vec, sizeof(float) * (size_t)idx->dim);
             /* Re-hash with slot index — may add duplicate but OK */
             for (int l = 0; l < idx->L; l++)
                 table_insert(&idx->tables[l], vec, idx->dim, i);
@@ -218,7 +218,7 @@ int lsh_search(const LSHIndex *idx, const float *query, int k,
     for (int ci = 0; ci < n_cands; ci++) {
         int s = cand_slots[ci];
         if (idx->vec_deleted[s]) continue;
-        float d = idx->dist_fn(query, idx->vectors + (size_t)s * idx->dim, idx->dim);
+        float d = idx->dist_fn(query, VS_VEC(&idx->vs, s), idx->dim);
         if (heap.size < k) heap_push(&heap, d, (uint64_t)s);
         else if (d < heap_top(&heap).key) { heap_pop(&heap); heap_push(&heap, d, (uint64_t)s); }
     }
@@ -236,7 +236,7 @@ int lsh_search(const LSHIndex *idx, const float *query, int k,
         int s = (int)items[i].id;
         results[i].id       = idx->vec_ids[s];
         results[i].distance = items[i].key;
-        strncpy(results[i].label, idx->vec_labels[s], 255);
+        strncpy(results[i].label, VS_LABEL(&idx->vs, s), 255);
         results[i].label[255] = '\0';
     }
     free(items);
@@ -281,8 +281,8 @@ int lsh_save(const LSHIndex *idx, void **out_buf, size_t *out_size) {
     for (int i = 0; i < idx->n_vecs; i++) {
         WU64(idx->vec_ids[i]);
         *p++ = idx->vec_deleted[i];
-        memcpy(p, idx->vec_labels[i], 256); p += 256;
-        memcpy(p, idx->vectors + (size_t)i * idx->dim, sizeof(float) * (size_t)idx->dim);
+        memcpy(p, VS_LABEL(&idx->vs, i), 256); p += 256;
+        memcpy(p, VS_VEC(&idx->vs, i), sizeof(float) * (size_t)idx->dim);
         p += sizeof(float) * (size_t)idx->dim;
     }
     /* tables */

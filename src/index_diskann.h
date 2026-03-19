@@ -14,6 +14,7 @@
 #define PISTADB_INDEX_DISKANN_H
 
 #include "pistadb_types.h"
+#include "vec_store.h"
 #include "distance.h"
 #include <stdint.h>
 
@@ -27,8 +28,7 @@ typedef struct {
 
 typedef struct {
     DiskANNNode *nodes;
-    float       *vectors;    /* [node_cap × dim] flat     */
-    char       (*labels)[256]; /* [node_cap] label store  */
+    VecStore     vs;           /* chunked vector + label storage */
     int          n_nodes;
     int          node_cap;
 

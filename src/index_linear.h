@@ -11,13 +11,13 @@
 #define PISTADB_INDEX_LINEAR_H
 
 #include "pistadb_types.h"
+#include "vec_store.h"
 #include "distance.h"
 #include <stdint.h>
 
 typedef struct {
-    float    *vectors;      /* [cap × dim] flat array          */
+    VecStore  vs;           /* chunked vector + label storage  */
     uint64_t *ids;          /* parallel id array               */
-    char    (*labels)[256]; /* parallel label array            */
     uint8_t  *deleted;      /* 1 = logically deleted           */
     int       size;         /* current number of entries       */
     int       cap;          /* allocated capacity              */

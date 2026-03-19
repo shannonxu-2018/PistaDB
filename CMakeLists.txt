@@ -96,6 +96,7 @@ set(PISTADB_SOURCES
 
 set(PISTADB_HEADERS
     src/pistadb_types.h
+    src/vec_store.h
     src/pistadb.h
     src/pistadb_batch.h
     src/pistadb_cache.h

@@ -22,33 +22,33 @@ int linear_create(LinearIndex *idx, int dim, DistFn dist_fn, int initial_cap) {
     idx->size    = 0;
     idx->cap     = initial_cap;
 
-    idx->vectors = (float    *)malloc(sizeof(float)    * (size_t)(initial_cap * dim));
     idx->ids     = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)initial_cap);
-    idx->labels  = (char (*)[256])malloc(256 * (size_t)initial_cap);
     idx->deleted = (uint8_t  *)calloc((size_t)initial_cap, 1);
 
-    if (!idx->vectors || !idx->ids || !idx->labels || !idx->deleted) {
-        free(idx->vectors); free(idx->ids); free(idx->labels); free(idx->deleted);
+    if (!idx->ids || !idx->deleted) {
+        free(idx->ids); free(idx->deleted);
         return PISTADB_ENOMEM;
     }
+    if (vs_init(&idx->vs, dim, initial_cap) != PISTADB_OK) return PISTADB_ENOMEM;
     return PISTADB_OK;
 }
 
 void linear_free(LinearIndex *idx) {
-    free(idx->vectors); free(idx->ids); free(idx->labels); free(idx->deleted);
-    idx->vectors = NULL; idx->ids = NULL; idx->labels = NULL; idx->deleted = NULL;
+    vs_free(&idx->vs);
+    free(idx->ids); free(idx->deleted);
+    idx->ids = NULL; idx->deleted = NULL;
     idx->size = idx->cap = 0;
 }
 
 static int linear_grow(LinearIndex *idx) {
     int nc = idx->cap * 2 + 8;
-    float    *nv = (float    *)realloc(idx->vectors, sizeof(float)    * (size_t)(nc * idx->dim));
+    int r = vs_ensure(&idx->vs, nc);
+    if (r != PISTADB_OK) return r;
     uint64_t *ni = (uint64_t *)realloc(idx->ids,     sizeof(uint64_t) * (size_t)nc);
-    char     (*nl)[256] = (char (*)[256])realloc(idx->labels, 256 * (size_t)nc);
     uint8_t  *nd = (uint8_t  *)realloc(idx->deleted, (size_t)nc);
-    if (!nv || !ni || !nl || !nd) return PISTADB_ENOMEM;
+    if (!ni || !nd) return PISTADB_ENOMEM;
     memset(nd + idx->cap, 0, (size_t)(nc - idx->cap));
-    idx->vectors = nv; idx->ids = ni; idx->labels = nl; idx->deleted = nd;
+    idx->ids = ni; idx->deleted = nd;
     idx->cap = nc;
     return PISTADB_OK;
 }
@@ -67,10 +67,10 @@ int linear_insert(LinearIndex *idx, uint64_t id, const char *label, const float 
     int slot = idx->size++;
     idx->ids[slot] = id;
     idx->deleted[slot] = 0;
-    memcpy(idx->vectors + (size_t)slot * idx->dim, vec, sizeof(float) * (size_t)idx->dim);
-    if (label) strncpy(idx->labels[slot], label, 255);
-    else        idx->labels[slot][0] = '\0';
-    idx->labels[slot][255] = '\0';
+    memcpy(VS_VEC(&idx->vs, slot), vec, sizeof(float) * (size_t)idx->dim);
+    if (label) strncpy(VS_LABEL(&idx->vs, slot), label, 255);
+    else        VS_LABEL(&idx->vs, slot)[0] = '\0';
+    VS_LABEL(&idx->vs, slot)[255] = '\0';
     return PISTADB_OK;
 }
 
@@ -84,7 +84,7 @@ int linear_delete(LinearIndex *idx, uint64_t id) {
 int linear_update(LinearIndex *idx, uint64_t id, const float *vec) {
     int slot = linear_find_id(idx, id);
     if (slot < 0) return PISTADB_ENOTFOUND;
-    memcpy(idx->vectors + (size_t)slot * idx->dim, vec, sizeof(float) * (size_t)idx->dim);
+    memcpy(VS_VEC(&idx->vs, slot), vec, sizeof(float) * (size_t)idx->dim);
     return PISTADB_OK;
 }
 
@@ -125,8 +125,8 @@ int linear_search(const LinearIndex *idx, const float *query, int k,
     int cnt = 0;
     for (int i = 0; i < idx->size; i++) {
         if (idx->deleted[i]) continue;
-        float d = idx->dist_fn(query, idx->vectors + (size_t)i * idx->dim, idx->dim);
-        result_insert(results, &cnt, k, idx->ids[i], d, idx->labels[i]);
+        float d = idx->dist_fn(query, VS_VEC(&idx->vs, i), idx->dim);
+        result_insert(results, &cnt, k, idx->ids[i], d, VS_LABEL(&idx->vs, i));
     }
     /* sort ascending by distance */
     for (int i = 0; i < cnt - 1; i++) {
@@ -164,8 +164,8 @@ int linear_save(const LinearIndex *idx, void **out_buf, size_t *out_size) {
     for (int i = 0; i < idx->size; i++) {
         *(uint64_t *)p = idx->ids[i];    p += 8;
         *p++ = idx->deleted[i];
-        memcpy(p, idx->labels[i], 256);  p += 256;
-        memcpy(p, idx->vectors + (size_t)i * idx->dim, sizeof(float) * (size_t)idx->dim);
+        memcpy(p, VS_LABEL(&idx->vs, i), 256);  p += 256;
+        memcpy(p, VS_VEC(&idx->vs, i), sizeof(float) * (size_t)idx->dim);
         p += sizeof(float) * (size_t)idx->dim;
     }
     *out_buf  = buf;

@@ -91,44 +91,37 @@ int hnsw_create(HNSWIndex *idx, int dim, DistFn dist_fn,
     idx->node_cap       = 64;
 
     idx->nodes   = (HNSWNode *)calloc((size_t)idx->node_cap, sizeof(HNSWNode));
-    idx->vectors = (float    *)malloc(sizeof(float) * (size_t)(idx->node_cap * dim));
-    idx->labels  = (char (*)[256])calloc((size_t)idx->node_cap, 256);
-    if (!idx->nodes || !idx->vectors || !idx->labels) return PISTADB_ENOMEM;
+    if (!idx->nodes) return PISTADB_ENOMEM;
+    if (vs_init(&idx->vs, dim, idx->node_cap) != PISTADB_OK) return PISTADB_ENOMEM;
     return PISTADB_OK;
 }
 
 void hnsw_free(HNSWIndex *idx) {
     for (int i = 0; i < idx->n_nodes; i++) node_free(&idx->nodes[i]);
     free(idx->nodes);
-    free(idx->vectors);
-    free(idx->labels);
-    idx->nodes = NULL; idx->vectors = NULL; idx->labels = NULL;
+    vs_free(&idx->vs);
+    idx->nodes = NULL;
     idx->n_nodes = idx->node_cap = 0;
 }
 
 static int hnsw_grow(HNSWIndex *idx) {
     int nc = idx->node_cap * 2 + 8;
-    HNSWNode *nn  = (HNSWNode *)realloc(idx->nodes,   sizeof(HNSWNode) * (size_t)nc);
-    float    *nv  = (float    *)realloc(idx->vectors,  sizeof(float)    * (size_t)(nc * idx->dim));
-    char (*nl)[256] = (char (*)[256])realloc(idx->labels, 256 * (size_t)nc);
-    if (!nn || !nv || !nl) return PISTADB_ENOMEM;
-    memset(nn + idx->node_cap, 0, sizeof(HNSWNode) * (size_t)(nc - idx->node_cap));
-    memset((char *)nl + 256 * idx->node_cap, 0, 256 * (size_t)(nc - idx->node_cap));
-    idx->nodes    = nn;
-    idx->vectors  = nv;
-    idx->labels   = nl;
+    HNSWNode *nn = (HNSWNode *)realloc(idx->nodes, sizeof(HNSWNode) * (size_t)nc);
+    if (!nn) return PISTADB_ENOMEM;
+    idx->nodes = nn;  /* assign early so pointer is not lost on vs_ensure failure */
+    int r = vs_ensure(&idx->vs, nc);
+    if (r != PISTADB_OK) return r;
+    memset(idx->nodes + idx->node_cap, 0, sizeof(HNSWNode) * (size_t)(nc - idx->node_cap));
     idx->node_cap = nc;
     return PISTADB_OK;
 }
 
 static inline float node_dist(const HNSWIndex *idx, int a, int b) {
-    return idx->dist_fn(idx->vectors + (size_t)a * idx->dim,
-                        idx->vectors + (size_t)b * idx->dim,
-                        idx->dim);
+    return idx->dist_fn(VS_VEC(&idx->vs, a), VS_VEC(&idx->vs, b), idx->dim);
 }
 
 static inline float query_dist(const HNSWIndex *idx, const float *q, int node) {
-    return idx->dist_fn(q, idx->vectors + (size_t)node * idx->dim, idx->dim);
+    return idx->dist_fn(q, VS_VEC(&idx->vs, node), idx->dim);
 }
 
 /* ── SEARCH-LAYER ────────────────────────────────────────────────────────── */
@@ -224,9 +217,9 @@ int hnsw_insert(HNSWIndex *idx, uint64_t id, const char *label, const float *vec
 
     int r = node_init(&idx->nodes[new_node], id, level, idx->M, idx->M_max0);
     if (r != PISTADB_OK) return r;
-    memcpy(idx->vectors + (size_t)new_node * idx->dim, vec, sizeof(float) * (size_t)idx->dim);
-    if (label) { strncpy(idx->labels[new_node], label, 255); idx->labels[new_node][255] = '\0'; }
-    else        idx->labels[new_node][0] = '\0';
+    memcpy(VS_VEC(&idx->vs, new_node), vec, sizeof(float) * (size_t)idx->dim);
+    if (label) { strncpy(VS_LABEL(&idx->vs, new_node), label, 255); VS_LABEL(&idx->vs, new_node)[255] = '\0'; }
+    else        VS_LABEL(&idx->vs, new_node)[0] = '\0';
     idx->n_nodes++;
 
     if (idx->ep_node == -1) {
@@ -325,7 +318,7 @@ int hnsw_delete(HNSWIndex *idx, uint64_t id) {
 int hnsw_update(HNSWIndex *idx, uint64_t id, const float *vec) {
     for (int i = 0; i < idx->n_nodes; i++) {
         if (idx->nodes[i].vec_id == id) {
-            memcpy(idx->vectors + (size_t)i * idx->dim, vec, sizeof(float) * (size_t)idx->dim);
+            memcpy(VS_VEC(&idx->vs, i), vec, sizeof(float) * (size_t)idx->dim);
             return PISTADB_OK;
         }
     }
@@ -372,7 +365,7 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
         if (idx->nodes[ni].vec_id == UINT64_MAX) continue;  /* deleted */
         results[cnt].id       = idx->nodes[ni].vec_id;
         results[cnt].distance = dist_buf[i];
-        strncpy(results[cnt].label, idx->labels[ni], 255);
+        strncpy(results[cnt].label, VS_LABEL(&idx->vs, ni), 255);
         results[cnt].label[255] = '\0';
         cnt++;
     }
@@ -427,8 +420,8 @@ int hnsw_save(const HNSWIndex *idx, void **out_buf, size_t *out_size) {
         const HNSWNode *n = &idx->nodes[i];
         WU64(n->vec_id);
         WI32(n->level);
-        memcpy(p, idx->labels[i], 256); p += 256;
-        const float *v = idx->vectors + (size_t)i * idx->dim;
+        memcpy(p, VS_LABEL(&idx->vs, i), 256); p += 256;
+        const float *v = (const float *)VS_VEC(&idx->vs, i);
         for (int d = 0; d < idx->dim; d++) WF32(v[d]);
         for (int l = 0; l <= n->level; l++) {
             WI32(n->neighbor_cnt[l]);
@@ -483,8 +476,8 @@ int hnsw_load(HNSWIndex *idx, const void *buf, size_t size,
         if (r != PISTADB_OK) return r;
         idx->n_nodes++;
 
-        memcpy(idx->labels[i], p, 256); p += 256;
-        float *v = idx->vectors + (size_t)i * idx->dim;
+        memcpy(VS_LABEL(&idx->vs, i), p, 256); p += 256;
+        float *v = VS_VEC(&idx->vs, i);
         for (int d = 0; d < idx->dim; d++) v[d] = RF32();
 
         for (int l = 0; l <= level; l++) {

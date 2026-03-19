@@ -102,13 +102,13 @@ int ivfpq_create(IVFPQIndex *idx, int dim, DistFn dist_fn,
     idx->list_sizes= (int       *)calloc((size_t)nlist, sizeof(int));
     idx->list_caps = (int       *)calloc((size_t)nlist, sizeof(int));
     idx->all_ids   = (uint64_t  *)malloc(sizeof(uint64_t)  * (size_t)idx->vec_cap);
-    idx->all_labels= (char (*)[256])malloc(256 * (size_t)idx->vec_cap);
     idx->all_deleted=(uint8_t   *)calloc((size_t)idx->vec_cap, 1);
 
     if (!idx->coarse_centroids || !idx->codebooks || !idx->pq_lists ||
         !idx->list_sizes || !idx->list_caps ||
-        !idx->all_ids || !idx->all_labels || !idx->all_deleted)
+        !idx->all_ids || !idx->all_deleted)
         return PISTADB_ENOMEM;
+    if (vs_init(&idx->vs, 0, idx->vec_cap) != PISTADB_OK) return PISTADB_ENOMEM;
     return PISTADB_OK;
 }
 
@@ -117,7 +117,7 @@ void ivfpq_free(IVFPQIndex *idx) {
     free(idx->codebooks);
     for (int c = 0; c < idx->nlist; c++) free(idx->pq_lists[c]);
     free(idx->pq_lists); free(idx->list_sizes); free(idx->list_caps);
-    free(idx->all_ids); free(idx->all_labels); free(idx->all_deleted);
+    free(idx->all_ids); vs_free(&idx->vs); free(idx->all_deleted);
     memset(idx, 0, sizeof(*idx));
 }
 
@@ -235,20 +235,21 @@ int ivfpq_insert(IVFPQIndex *idx, uint64_t id, const char *label, const float *v
     /* Grow label/id store */
     if (idx->n_vecs == idx->vec_cap) {
         int nc = idx->vec_cap * 2 + 8;
-        uint64_t *ni = (uint64_t *)realloc(idx->all_ids,    sizeof(uint64_t) * (size_t)nc);
-        char (*nl)[256] = (char (*)[256])realloc(idx->all_labels, 256 * (size_t)nc);
-        uint8_t *nd = (uint8_t *)realloc(idx->all_deleted, (size_t)nc);
-        if (!ni || !nl || !nd) return PISTADB_ENOMEM;
+        int r2 = vs_ensure(&idx->vs, nc);
+        if (r2 != PISTADB_OK) return r2;
+        uint64_t *ni = (uint64_t *)realloc(idx->all_ids,     sizeof(uint64_t) * (size_t)nc);
+        uint8_t  *nd = (uint8_t  *)realloc(idx->all_deleted, (size_t)nc);
+        if (!ni || !nd) return PISTADB_ENOMEM;
         memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
-        idx->all_ids = ni; idx->all_labels = nl; idx->all_deleted = nd;
+        idx->all_ids = ni; idx->all_deleted = nd;
         idx->vec_cap = nc;
     }
     int slot = idx->n_vecs++;
     idx->all_ids[slot] = id;
     idx->all_deleted[slot] = 0;
-    if (label) strncpy(idx->all_labels[slot], label, 255);
-    else        idx->all_labels[slot][0] = '\0';
-    idx->all_labels[slot][255] = '\0';
+    if (label) strncpy(VS_LABEL(&idx->vs, slot), label, 255);
+    else        VS_LABEL(&idx->vs, slot)[0] = '\0';
+    VS_LABEL(&idx->vs, slot)[255] = '\0';
 
     /* Coarse assignment */
     int best_c = 0; float bd = FLT_MAX;
@@ -287,7 +288,7 @@ int ivfpq_update(IVFPQIndex *idx, uint64_t id, const float *vec) {
     /* Find label */
     char lbl[256] = {0};
     for (int i = 0; i < idx->n_vecs; i++) {
-        if (idx->all_ids[i] == id) { strncpy(lbl, idx->all_labels[i], 255); break; }
+        if (idx->all_ids[i] == id) { strncpy(lbl, VS_LABEL(&idx->vs, i), 255); break; }
     }
     return ivfpq_insert(idx, id, lbl, vec);
 }
@@ -356,7 +357,7 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
         results[i].label[0] = '\0';
         for (int j = 0; j < idx->n_vecs; j++) {
             if (idx->all_ids[j] == is[i] && !idx->all_deleted[j]) {
-                strncpy(results[i].label, idx->all_labels[j], 255);
+                strncpy(results[i].label, VS_LABEL(&idx->vs, j), 255);
                 results[i].label[255] = '\0'; break;
             }
         }
@@ -392,7 +393,7 @@ int ivfpq_save(const IVFPQIndex *idx, void **out_buf, size_t *out_size) {
     for (int i = 0; i < idx->n_vecs; i++) {
         WU64(idx->all_ids[i]);
         *p++ = idx->all_deleted[i];
-        memcpy(p, idx->all_labels[i], 256); p += 256;
+        memcpy(p, VS_LABEL(&idx->vs, i), 256); p += 256;
     }
     for (int c = 0; c < idx->nlist; c++) {
         WI32(idx->list_sizes[c]);
@@ -428,17 +429,18 @@ int ivfpq_load(IVFPQIndex *idx, const void *buf, size_t size, int dim, DistFn di
     /* Grow label store */
     while (idx->vec_cap < n_vecs) {
         int nc = idx->vec_cap * 2 + 8;
-        uint64_t *ni = (uint64_t *)realloc(idx->all_ids, sizeof(uint64_t) * (size_t)nc);
-        char (*nl)[256] = (char (*)[256])realloc(idx->all_labels, 256 * (size_t)nc);
-        uint8_t *nd = (uint8_t *)realloc(idx->all_deleted, (size_t)nc);
-        if (!ni||!nl||!nd) return PISTADB_ENOMEM;
+        int rl = vs_ensure(&idx->vs, nc);
+        if (rl != PISTADB_OK) return rl;
+        uint64_t *ni = (uint64_t *)realloc(idx->all_ids,     sizeof(uint64_t) * (size_t)nc);
+        uint8_t  *nd = (uint8_t  *)realloc(idx->all_deleted, (size_t)nc);
+        if (!ni || !nd) return PISTADB_ENOMEM;
         memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
-        idx->all_ids=ni; idx->all_labels=nl; idx->all_deleted=nd; idx->vec_cap=nc;
+        idx->all_ids = ni; idx->all_deleted = nd; idx->vec_cap = nc;
     }
     for (int i = 0; i < n_vecs; i++) {
         idx->all_ids[i] = RU64();
         idx->all_deleted[i] = *p++;
-        memcpy(idx->all_labels[i], p, 256); p += 256;
+        memcpy(VS_LABEL(&idx->vs, i), p, 256); p += 256;
     }
     idx->n_vecs = n_vecs;
 

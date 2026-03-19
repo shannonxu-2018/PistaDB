@@ -11,6 +11,7 @@
 #define PISTADB_INDEX_IVF_H
 
 #include "pistadb_types.h"
+#include "vec_store.h"
 #include "distance.h"
 #include <stdint.h>
 
@@ -31,9 +32,8 @@ typedef struct {
     int         *list_caps;
 
     /* Flat vector storage (all inserted vectors) */
-    float    *vectors;
+    VecStore  vs;              /* chunked vector + label storage    */
     uint64_t *vec_ids;
-    char    (*vec_labels)[256];
     uint8_t  *vec_deleted;
     int       n_vecs;
     int       vec_cap;

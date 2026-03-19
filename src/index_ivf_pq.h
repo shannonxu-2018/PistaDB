@@ -14,6 +14,7 @@
 #define PISTADB_INDEX_IVF_PQ_H
 
 #include "pistadb_types.h"
+#include "vec_store.h"
 #include "distance.h"
 #include <stdint.h>
 
@@ -38,7 +39,7 @@ typedef struct {
 
     /* Original ids in insertion order (for label lookup) */
     uint64_t *all_ids;
-    char    (*all_labels)[256];
+    VecStore  vs;              /* label-only chunked store (dim=0) */
     uint8_t  *all_deleted;
     int       n_vecs, vec_cap;
 
