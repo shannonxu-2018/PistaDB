@@ -2,7 +2,7 @@
 
 [English](./README.md) · [中文](./README_CN.md)
 
-<h1>🌰 PistaDB</h1>
+<img src="img/logo.jpg" alt="PistaDB" width="420">
 
 <p><strong>The embedded vector database for LLM-native applications.</strong><br>
 RAG-ready · Zero dependencies · Single-file storage · MIT Licensed</p>

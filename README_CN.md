@@ -2,7 +2,7 @@
 
 [English](./README.md) · [中文](./README_CN.md)
 
-<h1>🌰 PistaDB</h1>
+<img src="img/logo.jpg" alt="PistaDB" width="420">
 
 <p><strong>专为 LLM 原生应用打造的嵌入式向量数据库。</strong><br>
 RAG 就绪 · 零外部依赖 · 单文件存储 · MIT 开源协议</p>
