@@ -40,6 +40,7 @@ class IndexType(IntEnum):
     DISKANN = 4
     LSH     = 5
     SCANN   = 6
+    SQ      = 7
 
     @classmethod
     def names(cls):

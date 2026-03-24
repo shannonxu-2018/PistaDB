@@ -17,6 +17,7 @@
 #include "index_diskann.h"
 #include "index_lsh.h"
 #include "index_scann.h"
+#include "index_sq.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -43,10 +44,13 @@ struct PistaDB {
         DiskANNIndex diskann;
         LSHIndex     lsh;
         ScaNNIndex   scann;
+        SQIndex      sq;
     } idx;
 
     /* Total vector count (including deleted) */
     uint64_t n_total;
+    /* Cached active (non-deleted) count, maintained on insert/delete */
+    int n_active;
 };
 
 /* ── Error helper ────────────────────────────────────────────────────────── */
@@ -111,10 +115,53 @@ static int create_index(PistaDB *db) {
                              p->scann_pq_M, p->scann_pq_bits,
                              p->scann_rerank_k, p->scann_aq_eta);
             break;
+        case INDEX_SQ:
+            r = sq_create(&db->idx.sq, db->dim, fn, 64);
+            break;
         default:
             r = PISTADB_EINVAL;
     }
     return r;
+}
+
+/* ── Recompute cached active count after load ────────────────────────────── */
+
+static void recompute_n_active(PistaDB *db) {
+    int cnt = 0;
+    switch (db->index_type) {
+        case INDEX_LINEAR:
+            for (int i = 0; i < db->idx.linear.size; i++)
+                if (!db->idx.linear.deleted[i]) cnt++;
+            break;
+        case INDEX_IVF:
+            for (int i = 0; i < db->idx.ivf.n_vecs; i++)
+                if (!db->idx.ivf.vec_deleted[i]) cnt++;
+            break;
+        case INDEX_LSH:
+            for (int i = 0; i < db->idx.lsh.n_vecs; i++)
+                if (!db->idx.lsh.vec_deleted[i]) cnt++;
+            break;
+        case INDEX_HNSW:
+            for (int i = 0; i < db->idx.hnsw.n_nodes; i++)
+                if (db->idx.hnsw.nodes[i].vec_id != UINT64_MAX) cnt++;
+            break;
+        case INDEX_DISKANN:
+            for (int i = 0; i < db->idx.diskann.n_nodes; i++)
+                if (!db->idx.diskann.nodes[i].deleted) cnt++;
+            break;
+        case INDEX_SCANN:
+            for (int i = 0; i < db->idx.scann.n_vecs; i++)
+                if (!db->idx.scann.all_deleted[i]) cnt++;
+            break;
+        case INDEX_SQ:
+            for (int i = 0; i < db->idx.sq.size; i++)
+                if (!db->idx.sq.deleted[i]) cnt++;
+            break;
+        default:
+            cnt = (int)db->n_total;
+            break;
+    }
+    db->n_active = cnt;
 }
 
 /* ── Load from file ──────────────────────────────────────────────────────── */
@@ -161,11 +208,15 @@ static int load_from_file(PistaDB *db) {
         case INDEX_SCANN:
             r = scann_load(&db->idx.scann, vec_buf, vec_sz, db->dim, fn, db->metric);
             break;
+        case INDEX_SQ:
+            r = sq_load(&db->idx.sq, vec_buf, vec_sz, db->dim, fn);
+            break;
         default:
             r = PISTADB_EINVAL;
     }
     free(vec_buf);
     free(idx_buf);
+    if (r == PISTADB_OK) recompute_n_active(db);
     return r;
 }
 
@@ -215,6 +266,7 @@ void pistadb_close(PistaDB *db) {
         case INDEX_DISKANN: diskann_free(&db->idx.diskann);  break;
         case INDEX_LSH:     lsh_free(&db->idx.lsh);         break;
         case INDEX_SCANN:   scann_free(&db->idx.scann);     break;
+        case INDEX_SQ:      sq_free(&db->idx.sq);           break;
     }
     free(db);
 }
@@ -260,6 +312,10 @@ int pistadb_save(PistaDB *db) {
             r = scann_save(&db->idx.scann, &vec_buf, &vec_sz);
             idx_buf = &placeholder; idx_sz = 1;
             break;
+        case INDEX_SQ:
+            r = sq_save(&db->idx.sq, &vec_buf, &vec_sz);
+            idx_buf = &placeholder; idx_sz = 1;
+            break;
         default:
             return PISTADB_EINVAL;
     }
@@ -286,9 +342,10 @@ int pistadb_insert(PistaDB *db, uint64_t id, const char *label, const float *vec
         case INDEX_DISKANN: r = diskann_insert(&db->idx.diskann, id, label, vec); break;
         case INDEX_LSH:     r = lsh_insert(&db->idx.lsh, id, label, vec);        break;
         case INDEX_SCANN:   r = scann_insert(&db->idx.scann, id, label, vec);   break;
+        case INDEX_SQ:      r = sq_insert(&db->idx.sq, id, label, vec);       break;
         default:            r = PISTADB_EINVAL;
     }
-    if (r == PISTADB_OK) { db->n_total++; if (id >= db->next_id) db->next_id = id + 1; }
+    if (r == PISTADB_OK) { db->n_total++; db->n_active++; if (id >= db->next_id) db->next_id = id + 1; }
     else set_err(db, r, err_str(r));
     return r;
 }
@@ -303,9 +360,11 @@ int pistadb_delete(PistaDB *db, uint64_t id) {
         case INDEX_DISKANN: r = diskann_delete(&db->idx.diskann, id);  break;
         case INDEX_LSH:     r = lsh_delete(&db->idx.lsh, id);         break;
         case INDEX_SCANN:   r = scann_delete(&db->idx.scann, id);     break;
+        case INDEX_SQ:      r = sq_delete(&db->idx.sq, id);         break;
         default:            r = PISTADB_EINVAL;
     }
-    if (r != PISTADB_OK) set_err(db, r, err_str(r));
+    if (r == PISTADB_OK) db->n_active--;
+    else set_err(db, r, err_str(r));
     return r;
 }
 
@@ -319,6 +378,7 @@ int pistadb_update(PistaDB *db, uint64_t id, const float *vec) {
         case INDEX_DISKANN: r = diskann_update(&db->idx.diskann, id, vec);  break;
         case INDEX_LSH:     r = lsh_update(&db->idx.lsh, id, vec);         break;
         case INDEX_SCANN:   r = scann_update(&db->idx.scann, id, vec);     break;
+        case INDEX_SQ:      r = sq_update(&db->idx.sq, id, vec);         break;
         default:            r = PISTADB_EINVAL;
     }
     if (r != PISTADB_OK) set_err(db, r, err_str(r));
@@ -376,6 +436,21 @@ int pistadb_get(PistaDB *db, uint64_t id, float *out_vec, char *out_label) {
             }
         }
     }
+    if (db->index_type == INDEX_SQ) {
+        SQIndex *sq = &db->idx.sq;
+        for (int i = 0; i < sq->size; i++) {
+            if (!sq->deleted[i] && sq->ids[i] == id) {
+                if (out_vec) {
+                    /* Dequantize uint8 codes back to float32 */
+                    const uint8_t *codes = sq->codes + (size_t)i * (size_t)sq->dim;
+                    for (int d = 0; d < sq->dim; d++)
+                        out_vec[d] = sq->vmin[d] + (float)codes[d] * (sq->vmax[d] - sq->vmin[d]) / 255.0f;
+                }
+                if (out_label) { strncpy(out_label, VS_LABEL(&sq->vs, i), 255); out_label[255] = '\0'; }
+                return PISTADB_OK;
+            }
+        }
+    }
     return PISTADB_ENOTFOUND;
 }
 
@@ -406,6 +481,9 @@ int pistadb_search(PistaDB *db, const float *query, int k,
             break;
         case INDEX_SCANN:
             r = scann_search(&db->idx.scann, query, k, results);
+            break;
+        case INDEX_SQ:
+            r = sq_search(&db->idx.sq, query, k, results);
             break;
         default:
             r = 0;
@@ -448,45 +526,7 @@ int pistadb_train(PistaDB *db) {
 /* ── Metadata ────────────────────────────────────────────────────────────── */
 
 int pistadb_count(PistaDB *db) {
-    switch (db->index_type) {
-        case INDEX_LINEAR: {
-            int cnt = 0;
-            for (int i = 0; i < db->idx.linear.size; i++)
-                if (!db->idx.linear.deleted[i]) cnt++;
-            return cnt;
-        }
-        case INDEX_IVF:    {
-            int cnt = 0;
-            for (int i = 0; i < db->idx.ivf.n_vecs; i++)
-                if (!db->idx.ivf.vec_deleted[i]) cnt++;
-            return cnt;
-        }
-        case INDEX_LSH:    {
-            int cnt = 0;
-            for (int i = 0; i < db->idx.lsh.n_vecs; i++)
-                if (!db->idx.lsh.vec_deleted[i]) cnt++;
-            return cnt;
-        }
-        case INDEX_HNSW: {
-            int cnt = 0;
-            for (int i = 0; i < db->idx.hnsw.n_nodes; i++)
-                if (db->idx.hnsw.nodes[i].vec_id != UINT64_MAX) cnt++;
-            return cnt;
-        }
-        case INDEX_DISKANN: {
-            int cnt = 0;
-            for (int i = 0; i < db->idx.diskann.n_nodes; i++)
-                if (!db->idx.diskann.nodes[i].deleted) cnt++;
-            return cnt;
-        }
-        case INDEX_SCANN: {
-            int cnt = 0;
-            for (int i = 0; i < db->idx.scann.n_vecs; i++)
-                if (!db->idx.scann.all_deleted[i]) cnt++;
-            return cnt;
-        }
-        default: return (int)db->n_total;
-    }
+    return db->n_active;
 }
 
 int              pistadb_dim(PistaDB *db)        { return db->dim; }

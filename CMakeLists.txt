@@ -88,6 +88,7 @@ set(PISTADB_SOURCES
     src/index_diskann.c
     src/index_lsh.c
     src/index_scann.c
+    src/index_sq.c
     src/pistadb.c
     src/pistadb_batch.c
     src/pistadb_cache.c
@@ -112,6 +113,7 @@ set(PISTADB_HEADERS
     src/index_diskann.h
     src/index_lsh.h
     src/index_scann.h
+    src/index_sq.h
 )
 
 # ── Shared library (for Python ctypes) ───────────────────────────────────

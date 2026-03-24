@@ -172,18 +172,14 @@ static int search_layer(const HNSWIndex *idx, const float *query,
 }
 
 /* ── SELECT-NEIGHBORS (simple: take M nearest from W) ───────────────────── */
-static void select_neighbors(Heap *W, int M, int *out, int *out_cnt) {
-    /* W is a max-heap. Collect all, sort, take M nearest. */
-    /* Extract all items into out[] */
+static int select_neighbors(Heap *W, int M, int *out, int *out_cnt) {
     *out_cnt = 0;
-    /* Temp: collect from max-heap, then reverse-select M nearest */
-    /* We'll use a small buffer on stack or heap */
     int total = W->size;
+    if (total == 0) return PISTADB_OK;
     float *keys = (float    *)malloc(sizeof(float)    * (size_t)total);
     int   *ids  = (int      *)malloc(sizeof(int)      * (size_t)total);
-    if (!keys || !ids) { free(keys); free(ids); return; }
+    if (!keys || !ids) { free(keys); free(ids); return PISTADB_ENOMEM; }
 
-    /* Drain W into arrays */
     int n = 0;
     while (W->size > 0) {
         HeapItem it = heap_pop(W);
@@ -191,17 +187,17 @@ static void select_neighbors(Heap *W, int M, int *out, int *out_cnt) {
         ids[n]  = (int)it.id;
         n++;
     }
-    /* Sort ascending (insertion sort – small arrays) */
+    /* Sort ascending (insertion sort - small arrays) */
     for (int i = 1; i < n; i++) {
         float ki = keys[i]; int ii = ids[i];
         int j = i - 1;
         while (j >= 0 && keys[j] > ki) { keys[j+1] = keys[j]; ids[j+1] = ids[j]; j--; }
         keys[j+1] = ki; ids[j+1] = ii;
     }
-    /* Take M nearest */
     *out_cnt = (n < M) ? n : M;
     for (int i = 0; i < *out_cnt; i++) out[i] = ids[i];
     free(keys); free(ids);
+    return PISTADB_OK;
 }
 
 /* ── INSERT ──────────────────────────────────────────────────────────────── */
@@ -489,8 +485,11 @@ int hnsw_load(HNSWIndex *idx, const void *buf, size_t size,
                 idx->nodes[i].neighbors[l]    = nd;
                 idx->nodes[i].neighbor_cap[l] = cnt;
             }
-            for (int j = 0; j < cnt; j++)
-                idx->nodes[i].neighbors[l][j] = RI32();
+            for (int j = 0; j < cnt; j++) {
+                int nb = RI32();
+                if (nb < 0 || nb >= n_nodes) nb = 0;
+                idx->nodes[i].neighbors[l][j] = nb;
+            }
         }
     }
 #undef RI32

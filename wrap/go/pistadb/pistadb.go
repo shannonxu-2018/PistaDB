@@ -147,6 +147,7 @@ const (
 	IndexDiskANN IndexType = 4 // Vamana / DiskANN — graph-based, disk-friendly
 	IndexLSH     IndexType = 5 // Locality-Sensitive Hashing — randomised, low memory
 	IndexSCANN   IndexType = 6 // ScaNN / Anisotropic Vector Quantization
+	IndexSQ      IndexType = 7 // Scalar Quantization (uint8) — 4x compression
 )
 
 func (t IndexType) String() string {
@@ -165,6 +166,8 @@ func (t IndexType) String() string {
 		return "LSH"
 	case IndexSCANN:
 		return "ScaNN"
+	case IndexSQ:
+		return "SQ"
 	default:
 		return fmt.Sprintf("IndexType(%d)", int(t))
 	}

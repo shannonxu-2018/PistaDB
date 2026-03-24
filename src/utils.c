@@ -84,9 +84,13 @@ int heap_push(Heap *h, float key, uint64_t id) {
     return PISTADB_OK;
 }
 
-HeapItem heap_top(const Heap *h) { return h->data[0]; }
+HeapItem heap_top(const Heap *h) {
+    if (h->size == 0) { HeapItem z = {0.0f, 0}; return z; }
+    return h->data[0];
+}
 
 HeapItem heap_pop(Heap *h) {
+    if (h->size == 0) { HeapItem z = {0.0f, 0}; return z; }
     HeapItem top = h->data[0];
     h->size--;
     if (h->size > 0) {
@@ -168,20 +172,37 @@ int bitset_init(Bitset *bs, int n_bits) {
 
 void bitset_free(Bitset *bs)  { free(bs->bits); bs->bits = NULL; }
 void bitset_clear(Bitset *bs) { memset(bs->bits, 0, (size_t)bs->n_bytes); }
-void bitset_set(Bitset *bs, int idx)       { bs->bits[idx >> 3] |=  (uint8_t)(1u << (idx & 7)); }
-int  bitset_test(const Bitset *bs, int idx){ return (bs->bits[idx >> 3] >> (idx & 7)) & 1; }
+void bitset_set(Bitset *bs, int idx) {
+    if (idx < 0 || idx >= bs->n_bits) return;
+    bs->bits[idx >> 3] |=  (uint8_t)(1u << (idx & 7));
+}
+int  bitset_test(const Bitset *bs, int idx) {
+    if (idx < 0 || idx >= bs->n_bits) return 0;
+    return (bs->bits[idx >> 3] >> (idx & 7)) & 1;
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
- * CRC32 (IEEE 802.3 polynomial, no-table version)
+ * CRC32 (IEEE 802.3 polynomial, 256-entry lookup table)
  * ══════════════════════════════════════════════════════════════════════════ */
 
+static uint32_t crc32_table[256];
+static int crc32_table_init = 0;
+
+static void crc32_init_table(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++)
+            c = (c >> 1) ^ (0xEDB88320u & ((c & 1u) ? 0xFFFFFFFFu : 0u));
+        crc32_table[i] = c;
+    }
+    crc32_table_init = 1;
+}
+
 uint32_t crc32_compute(const void *data, size_t len) {
+    if (!crc32_table_init) crc32_init_table();
     const uint8_t *p = (const uint8_t *)data;
     uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= p[i];
-        for (int j = 0; j < 8; j++)
-            crc = (crc >> 1) ^ (0xEDB88320u & ((crc & 1u) ? 0xFFFFFFFFu : 0u));
-    }
+    for (size_t i = 0; i < len; i++)
+        crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
     return crc ^ 0xFFFFFFFFu;
 }

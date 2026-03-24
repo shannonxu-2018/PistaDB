@@ -46,7 +46,10 @@ public enum IndexType {
      * Highest recall on cosine / IP metrics.
      * {@link PistaDB#train()} required before inserts.
      */
-    SCANN(6);
+    SCANN(6),
+
+    /** Scalar Quantization (uint8) – 4x memory savings, no training needed. */
+    SQ(7);
 
     final int value;
 

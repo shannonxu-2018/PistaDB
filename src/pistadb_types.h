@@ -45,7 +45,8 @@ typedef enum {
     INDEX_IVF_PQ  = 3,   /* IVF + Product Quantization               */
     INDEX_DISKANN = 4,   /* Vamana / DiskANN                         */
     INDEX_LSH     = 5,   /* Locality-Sensitive Hashing               */
-    INDEX_SCANN   = 6    /* ScaNN: Anisotropic Vector Quantization   */
+    INDEX_SCANN   = 6,   /* ScaNN: Anisotropic Vector Quantization   */
+    INDEX_SQ      = 7    /* Scalar Quantization (uint8)              */
 } PistaDBIndexType;
 
 /* ── Single search result ────────────────────────────────────────────────── */
