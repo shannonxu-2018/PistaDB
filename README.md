@@ -262,6 +262,30 @@ PISTADB_LIB_DIR=build pytest tests/ -v
 
 ---
 
+## Shuckr — Visual Database Browser
+
+**Shuckr** is a standalone GUI tool for visually browsing and managing PistaDB `.pst` files — inspired by [DB Browser for SQLite](https://sqlitebrowser.org/). Built with Python + PyQt6, it talks to the compiled native library (`pistadb.dll` / `libpistadb.so`) via ctypes.
+
+**Features:** Create / open `.pst` files · Browse vectors with pagination · Insert / edit / delete vectors · k-NN search with random query generation · Database metadata & raw header inspection · Unsaved-changes tracking
+
+### Quick Start
+
+```bash
+cd Shuckr
+pip install -r requirements.txt
+python main.py
+```
+
+Or on Windows, simply double-click `run.bat`.
+
+### Screenshots
+
+| Database Info | Browse Data | Search |
+|:---:|:---:|:---:|
+| ![Database Info](img/Shuckr_1.jpg) | ![Browse Data](img/Shuckr_2.jpg) | ![Search](img/Shuckr_3.jpg) |
+
+---
+
 ## Documentation
 
 | Document | Contents |

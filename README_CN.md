@@ -262,6 +262,30 @@ PISTADB_LIB_DIR=build pytest tests/ -v
 
 ---
 
+## Shuckr — 可视化数据库浏览器
+
+**Shuckr** 是一个独立的 GUI 工具，用于可视化浏览和管理 PistaDB `.pst` 文件——灵感源自 [DB Browser for SQLite](https://sqlitebrowser.org/)。基于 Python + PyQt6 构建，通过 ctypes 调用编译好的本地库（`pistadb.dll` / `libpistadb.so`）。
+
+**功能：** 创建 / 打开 `.pst` 文件 · 分页浏览向量数据 · 插入 / 编辑 / 删除向量 · k-NN 搜索与随机查询生成 · 数据库元信息与原始文件头查看 · 未保存更改追踪
+
+### 快速启动
+
+```bash
+cd Shuckr
+pip install -r requirements.txt
+python main.py
+```
+
+Windows 用户也可直接双击 `run.bat` 启动。
+
+### 界面截图
+
+| 数据库信息 | 数据浏览 | 向量搜索 |
+|:---:|:---:|:---:|
+| ![数据库信息](img/Shuckr_1.jpg) | ![数据浏览](img/Shuckr_2.jpg) | ![向量搜索](img/Shuckr_3.jpg) |
+
+---
+
 ## 文档
 
 | 文档 | 内容 |
