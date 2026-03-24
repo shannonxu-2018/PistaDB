@@ -43,7 +43,7 @@ let package = Package(
         .target(
             name: "PistaDBObjC",
             dependencies: ["CPistaDB"],
-            path: "ios/Sources/PistaDBObjC",
+            path: "wrap/ios/Sources/PistaDBObjC",
             publicHeadersPath: "include",
             cSettings: [
                 // Silence ObjC nullability / deprecation noise from the C headers
@@ -55,7 +55,7 @@ let package = Package(
         .target(
             name: "PistaDB",
             dependencies: ["PistaDBObjC"],
-            path: "ios/Sources/PistaDB"
+            path: "wrap/ios/Sources/PistaDB"
         ),
     ]
 )

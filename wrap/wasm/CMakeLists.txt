@@ -20,17 +20,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── Source files (same C core as the native build) ────────────────────────────
 set(PISTADB_SOURCES
-    ../src/distance.c
-    ../src/utils.c
-    ../src/storage.c
-    ../src/index_linear.c
-    ../src/index_hnsw.c
-    ../src/index_ivf.c
-    ../src/index_ivf_pq.c
-    ../src/index_diskann.c
-    ../src/index_lsh.c
-    ../src/index_scann.c
-    ../src/pistadb.c
+    ../../src/distance.c
+    ../../src/utils.c
+    ../../src/storage.c
+    ../../src/index_linear.c
+    ../../src/index_hnsw.c
+    ../../src/index_ivf.c
+    ../../src/index_ivf_pq.c
+    ../../src/index_diskann.c
+    ../../src/index_lsh.c
+    ../../src/index_scann.c
+    ../../src/pistadb.c
 )
 
 # ── Build target ──────────────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ add_executable(pistadb_wasm
     ${PISTADB_SOURCES}
 )
 
-target_include_directories(pistadb_wasm PRIVATE ../src)
+target_include_directories(pistadb_wasm PRIVATE ../../src)
 
 # ── Compiler flags ────────────────────────────────────────────────────────────
 target_compile_options(pistadb_wasm PRIVATE

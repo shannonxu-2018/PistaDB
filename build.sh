@@ -23,7 +23,7 @@ find "$BUILD_DIR" -name "*.dll" -o -name "*.so" -o -name "*.dylib" 2>/dev/null |
 
 echo ""
 echo "To install the Python package:"
-echo "  pip install -e python/"
+echo "  pip install -e wrap/python/"
 echo ""
 echo "To run tests:"
 echo "  PISTADB_LIB_DIR=build/Release pytest tests/ -v"

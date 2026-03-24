@@ -19,7 +19,7 @@ echo === Build complete ===
 echo Shared library should be in build\%BUILD_TYPE%\pistadb.dll
 echo.
 echo To install the Python package:
-echo   pip install -e python\
+echo   pip install -e wrap\python\
 echo.
 echo To run tests (PowerShell):
 echo   $env:PISTADB_LIB_DIR="build\%BUILD_TYPE%"; pytest tests\ -v

@@ -142,14 +142,15 @@ PistaDB/
 │   ├── index_diskann.*           # Vamana / DiskANN (Subramanya et al., 2019)
 │   ├── index_lsh.*               # E2LSH + sign-based LSH
 │   └── index_scann.*             # ScaNN: Anisotropic Vector Quantization (Guo et al., ICML 2020)
-├── python/                       # Python binding (pure ctypes, no Cython)
-├── go/                           # Go binding (CGO), module: pistadb.io/go
-├── android/                      # Android JNI bridge + Java + Kotlin API
-├── ios/                          # iOS/macOS ObjC + Swift SPM package
-├── wasm/                         # WebAssembly binding (Emscripten + Embind)
-├── cpp/                          # C++ header-only wrapper (C++17)
-├── rust/                         # Rust FFI crate (no external deps)
-├── csharp/                       # C# P/Invoke binding (.NET Standard 2.0)
+├── wrap/                         # All language bindings
+│   ├── python/                   # Python binding (pure ctypes, no Cython)
+│   ├── go/                       # Go binding (CGO), module: pistadb.io/go
+│   ├── android/                  # Android JNI bridge + Java + Kotlin API
+│   ├── ios/                      # iOS/macOS ObjC + Swift SPM package
+│   ├── wasm/                     # WebAssembly binding (Emscripten + Embind)
+│   ├── cpp/                      # C++ header-only wrapper (C++17)
+│   ├── rust/                     # Rust FFI crate (no external deps)
+│   └── csharp/                   # C# P/Invoke binding (.NET Standard 2.0)
 ├── tests/
 │   └── test_pistadb.py           # 109-test pytest suite
 ├── examples/

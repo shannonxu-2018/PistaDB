@@ -13,7 +13,7 @@ The `android/` module is a self-contained Android library. Add it to your projec
 ```groovy
 // settings.gradle
 include ':android'
-project(':android').projectDir = new File('../PistaDB/android')
+project(':android').projectDir = new File('../PistaDB/wrap/android')
 
 // app/build.gradle
 dependencies {
@@ -363,7 +363,7 @@ location ~* \.wasm$ {
 
 ```cmake
 add_subdirectory(PistaDB)        # builds pistadb shared library
-add_subdirectory(PistaDB/cpp)    # registers pistadb_cpp INTERFACE target
+add_subdirectory(PistaDB/wrap/cpp)    # registers pistadb_cpp INTERFACE target
 
 target_link_libraries(my_app PRIVATE pistadb_cpp)
 ```
@@ -459,7 +459,7 @@ The `rust/` directory is a standard Cargo crate (`pistadb`, no external dependen
 
 ```toml
 [dependencies]
-pistadb = { path = "../PistaDB/rust" }
+pistadb = { path = "../PistaDB/wrap/rust" }
 ```
 
 Set the library search path before building:
@@ -561,7 +561,7 @@ go 1.21
 
 require pistadb.io/go v0.0.0
 
-replace pistadb.io/go => ../PistaDB/go
+replace pistadb.io/go => ../PistaDB/wrap/go
 ```
 
 Build the C library first, then build normally:

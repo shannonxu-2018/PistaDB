@@ -13,7 +13,7 @@ add_compile_options(-Wall -Wextra -O3 -ffast-math)
 
 # ── Source paths ───────────────────────────────────────────────────────────
 # CMakeLists.txt lives in android/; PistaDB C sources are in ../src/
-set(PISTADB_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+set(PISTADB_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 
 set(PISTADB_C_SOURCES
     ${PISTADB_SRC}/distance.c

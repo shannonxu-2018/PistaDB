@@ -2,7 +2,7 @@
 //!
 //! Search order:
 //!   1. `PISTADB_LIB_DIR` environment variable (highest priority)
-//!   2. `../build`, `../build/Release`, `../build/Debug`  (relative to this crate)
+//!   2. `../../build`, `../../build/Release`, `../../build/Debug`  (relative to this crate)
 
 fn main() {
     println!("cargo:rerun-if-env-changed=PISTADB_LIB_DIR");
@@ -10,10 +10,11 @@ fn main() {
     if let Ok(dir) = std::env::var("PISTADB_LIB_DIR") {
         println!("cargo:rustc-link-search=native={}", dir);
     } else {
-        // Crate is at <repo>/rust/ — walk up one level to reach the repo root.
+        // Crate is at <repo>/wrap/rust/ — walk up two levels to reach the repo root.
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         let root = std::path::Path::new(&manifest_dir)
-            .parent()
+            .parent() // wrap/rust/ -> wrap/
+            .and_then(|p| p.parent()) // wrap/ -> repo root
             .expect("could not resolve repo root from CARGO_MANIFEST_DIR");
 
         for sub in &["build", "build/Release", "build/Debug"] {

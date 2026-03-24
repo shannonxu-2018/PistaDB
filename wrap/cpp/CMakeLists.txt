@@ -19,7 +19,7 @@ target_compile_features(pistadb_cpp INTERFACE cxx_std_17)
 
 target_include_directories(pistadb_cpp INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>        # exposes pistadb.hpp
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../src> # exposes pistadb.h (C API)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../src> # exposes pistadb.h (C API)
     $<INSTALL_INTERFACE:include>
 )
 

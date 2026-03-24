@@ -89,16 +89,16 @@ PistaDB is purpose-built for **local RAG pipelines, offline AI agents, privacy-s
 
 | Language | Binding mechanism | Where to find it |
 |---|---|---|
-| **C / C++** | Direct `#include` | `src/pistadb.h` / `cpp/pistadb.hpp` |
-| **Python** | `ctypes` (no Cython) | `python/` |
-| **Go** | CGO | `go/` |
-| **Java** | JNI | `android/src/main/java/` |
-| **Kotlin** | JNI + extension functions | `android/src/main/kotlin/` |
-| **Objective-C** | Direct C interop | `ios/Sources/PistaDBObjC/` |
-| **Swift** | ObjC bridge | `ios/Sources/PistaDB/` |
-| **C#** | P/Invoke | `csharp/` |
-| **Rust** | FFI (`extern "C"`) | `rust/` |
-| **WASM** | Emscripten / Embind | `wasm/` |
+| **C / C++** | Direct `#include` | `src/pistadb.h` / `wrap/cpp/pistadb.hpp` |
+| **Python** | `ctypes` (no Cython) | `wrap/python/` |
+| **Go** | CGO | `wrap/go/` |
+| **Java** | JNI | `wrap/android/src/main/java/` |
+| **Kotlin** | JNI + extension functions | `wrap/android/src/main/kotlin/` |
+| **Objective-C** | Direct C interop | `wrap/ios/Sources/PistaDBObjC/` |
+| **Swift** | ObjC bridge | `wrap/ios/Sources/PistaDB/` |
+| **C#** | P/Invoke | `wrap/csharp/` |
+| **Rust** | FFI (`extern "C"`) | `wrap/rust/` |
+| **WASM** | Emscripten / Embind | `wrap/wasm/` |
 
 | Platform | Library output | ABI targets |
 |---|---|---|
@@ -130,21 +130,21 @@ Produces `pistadb.dll` (Windows) or `libpistadb.so` (Linux / macOS) with **zero 
 ### 2. Install the Python Binding
 
 ```bash
-pip install -e python/
+pip install -e wrap/python/
 ```
 
 No Rust compiler. No CMake for the Python step. No surprises.
 
 ### 3. Android Integration
 
-Open `android/` as a library module in Android Studio, or declare it in `settings.gradle`:
+Open `wrap/android/` as a library module in Android Studio, or declare it in `settings.gradle`:
 
 ```groovy
 include ':android'
-project(':android').projectDir = new File('<path-to-PistaDB>/android')
+project(':android').projectDir = new File('<path-to-PistaDB>/wrap/android')
 ```
 
-The NDK build is handled automatically by `android/CMakeLists.txt`. Ensure NDK `26.x` is installed and `ndkVersion` in `android/build.gradle` matches.
+The NDK build is handled automatically by `wrap/android/CMakeLists.txt`. Ensure NDK `26.x` is installed and `ndkVersion` in `wrap/android/build.gradle` matches.
 
 ### 4. iOS / macOS Integration (Swift Package Manager)
 
@@ -161,8 +161,8 @@ The `Package.swift` at the project root declares three targets — `CPistaDB` (C
 
 ```bash
 source /path/to/emsdk/emsdk_env.sh
-cd wasm && bash build.sh
-# → wasm/build/pistadb.js + pistadb.wasm
+cd wrap/wasm && bash build.sh
+# → wrap/wasm/build/pistadb.js + pistadb.wasm
 ```
 
 Serve both files from the same HTTP origin, or use directly in Node.js.
@@ -171,7 +171,7 @@ Serve both files from the same HTTP origin, or use directly in Node.js.
 
 ```cmake
 add_subdirectory(PistaDB)
-add_subdirectory(PistaDB/cpp)
+add_subdirectory(PistaDB/wrap/cpp)
 target_link_libraries(my_app PRIVATE pistadb_cpp)
 ```
 
@@ -179,7 +179,7 @@ target_link_libraries(my_app PRIVATE pistadb_cpp)
 
 ```go
 // go.mod
-replace pistadb.io/go => ../PistaDB/go
+replace pistadb.io/go => ../PistaDB/wrap/go
 ```
 
 ```bash
@@ -191,8 +191,8 @@ go build ./...
 ### 8. Rust Integration
 
 ```bash
-cd rust
-PISTADB_LIB_DIR=../build cargo build --release
+cd wrap/rust
+PISTADB_LIB_DIR=../../build cargo build --release
 ```
 
 ### 9. C# / .NET Integration
@@ -200,7 +200,7 @@ PISTADB_LIB_DIR=../build cargo build --release
 ```xml
 <!-- In your .csproj -->
 <ItemGroup>
-  <ProjectReference Include="../PistaDB/csharp/PistaDB.csproj" />
+  <ProjectReference Include="../PistaDB/wrap/csharp/PistaDB.csproj" />
 </ItemGroup>
 ```
 
