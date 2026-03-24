@@ -50,7 +50,7 @@ PistaDB is purpose-built for **local RAG pipelines, offline AI agents, privacy-s
 
 ## Key Features
 
-### 7 Production-Ready Index Algorithms
+### 8 Production-Ready Index Algorithms
 
 | Index | Algorithm | Best For |
 |-------|-----------|----------|
@@ -61,6 +61,7 @@ PistaDB is purpose-built for **local RAG pipelines, offline AI agents, privacy-s
 | `DISKANN` | Vamana graph (DiskANN) | Billion-scale embedding collections |
 | `LSH` | Locality-Sensitive Hashing | Ultra-low memory footprint |
 | `SCANN` | Anisotropic Vector Quantization (Google ScaNN) | Maximum recall on MIPS / cosine workloads |
+| `SQ` | Scalar Quantization (uint8) | **4× memory & storage savings**, no training needed |
 
 ### 5 Distance Metrics — All LLM Embedding Models Covered
 
@@ -79,7 +80,9 @@ PistaDB is purpose-built for **local RAG pipelines, offline AI agents, privacy-s
 - **Transactions** — ACID-style atomic multi-op groups with full undo-on-failure rollback
 - **Multi-threaded batch insert** — thread-pool + ring-buffer API for high-throughput embedding pipelines
 - **Embedding cache** — persistent LRU cache (`.pcc`) that eliminates redundant model calls
-- **Single-file storage** — CRC32-verified `.pst` format; atomic save, no partial writes
+- **Single-file storage** — CRC32-verified `.pst` format (lookup-table accelerated); atomic save, no partial writes
+- **O(1) vector count** — cached active-vector count maintained on insert/delete, no linear scans
+- **Hardened internals** — bitset bounds checks, heap empty-access guards, HNSW neighbor bounds validation on file load
 - **9 language bindings** — C, C++, Python, Go, Java, Kotlin, Swift, Objective-C, C#, Rust, WASM
 - **109 / 109 tests passing** across all features and platforms
 
