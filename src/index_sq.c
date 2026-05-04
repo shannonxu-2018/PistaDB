@@ -49,29 +49,38 @@ static void sq_dequantize_vec(const uint8_t *codes, float *out,
         out[d] = sq_dequantize_val(codes[d], vmin[d], vmax[d]);
 }
 
-/* Fast L2 distance on quantized codes (integer arithmetic). */
-static inline float sq_dist_l2_codes(const uint8_t *a, const uint8_t *b, int dim) {
-    uint32_t sum = 0;
-    for (int d = 0; d < dim; d++) {
-        int diff = (int)a[d] - (int)b[d];
-        sum += (uint32_t)(diff * diff);
-    }
-    return (float)sum;
-}
-
 /* ── Update min/max stats with a new vector ─────────────────────────────── */
-
-static void sq_update_stats(SQIndex *idx, const float *vec) {
+/* Returns 1 if the per-dimension range was widened by this vector, 0 if it
+ * fits inside the existing bounds.  Callers use this to decide whether
+ * previously-stored codes must be re-quantised against the new range. */
+static int sq_update_stats(SQIndex *idx, const float *vec) {
+    int changed = 0;
     for (int d = 0; d < idx->dim; d++) {
-        if (vec[d] < idx->vmin[d]) idx->vmin[d] = vec[d];
-        if (vec[d] > idx->vmax[d]) idx->vmax[d] = vec[d];
+        if (vec[d] < idx->vmin[d]) { idx->vmin[d] = vec[d]; changed = 1; }
+        if (vec[d] > idx->vmax[d]) { idx->vmax[d] = vec[d]; changed = 1; }
     }
+    return changed;
 }
 
-/* ── Re-quantize all vectors with current min/max ───────────────────────── */
-
-static void sq_requantize_all(SQIndex *idx) {
-    (void)idx;
+/* ── Re-quantize all stored vectors with the current min/max ────────────── */
+/* The naïve scheme stores 8-bit codes referenced to per-dim [vmin,vmax].
+ * When the range widens, codes produced earlier are scaled wrong (they
+ * compress the tighter old range into 0..255).  Without a true raw-vector
+ * snapshot we can only approximate the original floats by dequantising
+ * with the OLD range, then re-quantising with the NEW range — reasonable
+ * but not lossless.  Caller must pass the previous range arrays. */
+static void sq_requantize_all(SQIndex *idx,
+                              const float *old_vmin, const float *old_vmax) {
+    for (int i = 0; i < idx->size; i++) {
+        if (idx->deleted[i]) continue;
+        uint8_t *codes = idx->codes + (size_t)i * (size_t)idx->dim;
+        for (int d = 0; d < idx->dim; d++) {
+            /* Decode with the old range */
+            float val = sq_dequantize_val(codes[d], old_vmin[d], old_vmax[d]);
+            /* Encode with the new range */
+            codes[d] = sq_quantize_val(val, idx->vmin[d], idx->vmax[d]);
+        }
+    }
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
@@ -119,16 +128,23 @@ static int sq_grow(SQIndex *idx) {
     int r = vs_ensure(&idx->vs, nc);
     if (r != PISTADB_OK) return r;
 
-    uint8_t  *new_codes = (uint8_t  *)realloc(idx->codes, sizeof(uint8_t) * (size_t)nc * (size_t)idx->dim);
-    uint64_t *new_ids   = (uint64_t *)realloc(idx->ids,   sizeof(uint64_t) * (size_t)nc);
-    uint8_t  *new_del   = (uint8_t  *)realloc(idx->deleted, (size_t)nc);
-    if (!new_codes || !new_ids || !new_del) return PISTADB_ENOMEM;
+    /* Commit each realloc result individually so a later failure does not
+     * dangle the not-yet-assigned pointer. */
+    uint8_t *new_codes = (uint8_t *)realloc(
+        idx->codes, sizeof(uint8_t) * (size_t)nc * (size_t)idx->dim);
+    if (!new_codes) return PISTADB_ENOMEM;
+    idx->codes = new_codes;
+
+    uint64_t *new_ids = (uint64_t *)realloc(idx->ids, sizeof(uint64_t) * (size_t)nc);
+    if (!new_ids) return PISTADB_ENOMEM;
+    idx->ids = new_ids;
+
+    uint8_t *new_del = (uint8_t *)realloc(idx->deleted, (size_t)nc);
+    if (!new_del) return PISTADB_ENOMEM;
+    idx->deleted = new_del;
 
     memset(new_del + idx->cap, 0, (size_t)(nc - idx->cap));
-    idx->codes   = new_codes;
-    idx->ids     = new_ids;
-    idx->deleted = new_del;
-    idx->cap     = nc;
+    idx->cap = nc;
     return PISTADB_OK;
 }
 
@@ -140,12 +156,34 @@ int sq_insert(SQIndex *idx, uint64_t id, const char *label, const float *vec) {
         if (r != PISTADB_OK) return r;
     }
 
+    /* Cheap pre-check: only snapshot + requantise when the new vector actually
+     * widens the per-dimension range.  In the steady state most inserts fall
+     * inside the bounds, so this avoids 2*dim*4 bytes of malloc per call. */
+    int will_widen = 0;
+    if (idx->size > 0) {
+        for (int d = 0; d < idx->dim; d++) {
+            if (vec[d] < idx->vmin[d] || vec[d] > idx->vmax[d]) { will_widen = 1; break; }
+        }
+    }
+
+    if (will_widen) {
+        float *old_vmin = (float *)malloc(sizeof(float) * (size_t)idx->dim);
+        float *old_vmax = (float *)malloc(sizeof(float) * (size_t)idx->dim);
+        if (!old_vmin || !old_vmax) { free(old_vmin); free(old_vmax); return PISTADB_ENOMEM; }
+        memcpy(old_vmin, idx->vmin, sizeof(float) * (size_t)idx->dim);
+        memcpy(old_vmax, idx->vmax, sizeof(float) * (size_t)idx->dim);
+        sq_update_stats(idx, vec);
+        sq_requantize_all(idx, old_vmin, old_vmax);
+        free(old_vmin); free(old_vmax);
+    } else {
+        /* No requantise needed — but still update stats so the very first
+         * insert (size == 0) initialises vmin/vmax from the vector itself. */
+        sq_update_stats(idx, vec);
+    }
+
     int slot = idx->size++;
     idx->ids[slot] = id;
     idx->deleted[slot] = 0;
-
-    /* Update per-dimension stats */
-    sq_update_stats(idx, vec);
 
     /* Quantize and store */
     sq_quantize_vec(vec, idx->codes + (size_t)slot * (size_t)idx->dim,
@@ -172,7 +210,23 @@ int sq_delete(SQIndex *idx, uint64_t id) {
 int sq_update(SQIndex *idx, uint64_t id, const float *vec) {
     for (int i = 0; i < idx->size; i++) {
         if (!idx->deleted[i] && idx->ids[i] == id) {
-            sq_update_stats(idx, vec);
+            /* Same cheap pre-check as sq_insert: only snapshot + requantise
+             * when the replacement vector actually widens the bounds. */
+            int will_widen = 0;
+            for (int d = 0; d < idx->dim; d++) {
+                if (vec[d] < idx->vmin[d] || vec[d] > idx->vmax[d]) { will_widen = 1; break; }
+            }
+            if (will_widen) {
+                float *old_vmin = (float *)malloc(sizeof(float) * (size_t)idx->dim);
+                float *old_vmax = (float *)malloc(sizeof(float) * (size_t)idx->dim);
+                if (!old_vmin || !old_vmax) { free(old_vmin); free(old_vmax); return PISTADB_ENOMEM; }
+                memcpy(old_vmin, idx->vmin, sizeof(float) * (size_t)idx->dim);
+                memcpy(old_vmax, idx->vmax, sizeof(float) * (size_t)idx->dim);
+                sq_update_stats(idx, vec);
+                sq_requantize_all(idx, old_vmin, old_vmax);
+                free(old_vmin); free(old_vmax);
+            }
+
             sq_quantize_vec(vec, idx->codes + (size_t)i * (size_t)idx->dim,
                             idx->vmin, idx->vmax, idx->dim);
             return PISTADB_OK;
@@ -212,32 +266,39 @@ static void sq_result_insert(PistaDBResult *res, int *cnt, int k,
     }
 }
 
+/* qsort comparator: ascending by distance. */
+static int sq_cmp_result(const void *a, const void *b) {
+    float da = ((const PistaDBResult *)a)->distance;
+    float db = ((const PistaDBResult *)b)->distance;
+    return (da > db) - (da < db);
+}
+
 int sq_search(const SQIndex *idx, const float *query, int k,
               PistaDBResult *results) {
-    if (idx->size == 0) return 0;
+    if (idx->size == 0 || k <= 0) return 0;
 
-    /* Quantize query using current stats */
-    uint8_t *q_codes = (uint8_t *)malloc(sizeof(uint8_t) * (size_t)idx->dim);
-    if (!q_codes) return 0;
-    sq_quantize_vec(query, q_codes, idx->vmin, idx->vmax, idx->dim);
+    /* Fast path for the L2 family: ranking on integer codes is monotone with
+     * the true L2² distance only when every dimension shares the same scale,
+     * which is not the case for per-dim min/max.  Be safe and dequantise into
+     * a scratch buffer, then use the distance function the caller asked for.
+     * 4-byte temp per query — negligible.  */
+    float *cand = (float *)malloc(sizeof(float) * (size_t)idx->dim);
+    if (!cand) return 0;
 
+    DistFn dfn = idx->dist_fn ? idx->dist_fn : dist_l2;
     int cnt = 0;
     for (int i = 0; i < idx->size; i++) {
         if (idx->deleted[i]) continue;
-        float d = sq_dist_l2_codes(q_codes, idx->codes + (size_t)i * (size_t)idx->dim, idx->dim);
+        const uint8_t *codes = idx->codes + (size_t)i * (size_t)idx->dim;
+        sq_dequantize_vec(codes, cand, idx->vmin, idx->vmax, idx->dim);
+        float d = dfn(query, cand, idx->dim);
         sq_result_insert(results, &cnt, k, idx->ids[i], d, VS_LABEL(&idx->vs, i));
     }
+    free(cand);
 
-    /* Sort ascending by distance */
-    for (int i = 0; i < cnt - 1; i++) {
-        for (int j = i + 1; j < cnt; j++) {
-            if (results[j].distance < results[i].distance) {
-                PistaDBResult tmp = results[i]; results[i] = results[j]; results[j] = tmp;
-            }
-        }
-    }
-
-    free(q_codes);
+    /* O(k log k) final sort; the partial-result heap above only kept the top
+     * k as a max-heap-like array, so we still need to order ascending. */
+    if (cnt > 1) qsort(results, (size_t)cnt, sizeof(PistaDBResult), sq_cmp_result);
     return cnt;
 }
 
@@ -293,9 +354,12 @@ int sq_load(SQIndex *idx, const void *buf, size_t size,
     int32_t count = *(const int32_t *)p; p += 4;
     int32_t fdim  = *(const int32_t *)p; p += 4;
     if (fdim != dim) return PISTADB_ECORRUPT;
+    if (count < 0) return PISTADB_ECORRUPT;
 
     size_t hdr_sz = sizeof(int32_t) * 2 + sizeof(float) * (size_t)dim * 2;
+    if (size < hdr_sz) return PISTADB_ECORRUPT;
     size_t entry  = sizeof(uint64_t) + 1 + 256 + (size_t)dim;
+    if ((size_t)count > (size - hdr_sz) / (entry ? entry : 1)) return PISTADB_ECORRUPT;
     if (size < hdr_sz + (size_t)count * entry) return PISTADB_ECORRUPT;
 
     int r = sq_create(idx, dim, dist_fn, count + 8);

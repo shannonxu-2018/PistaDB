@@ -48,6 +48,8 @@ static int kmeans(const float *data, int n, int dim, int K, float *centroids,
     float *new_c = (float *)calloc((size_t)(K * dim), sizeof(float));
     int   *cnt   = (int   *)calloc((size_t)K, sizeof(int));
     if (!assign || !new_c || !cnt) { free(assign); free(new_c); free(cnt); return PISTADB_ENOMEM; }
+    /* Sentinel so iter-0 change-count does not read uninitialised memory. */
+    memset(assign, -1, sizeof(int) * (size_t)n);
 
     for (int iter = 0; iter < max_iter; iter++) {
         int changed = 0;
@@ -237,11 +239,13 @@ int ivfpq_insert(IVFPQIndex *idx, uint64_t id, const char *label, const float *v
         int nc = idx->vec_cap * 2 + 8;
         int r2 = vs_ensure(&idx->vs, nc);
         if (r2 != PISTADB_OK) return r2;
-        uint64_t *ni = (uint64_t *)realloc(idx->all_ids,     sizeof(uint64_t) * (size_t)nc);
+        uint64_t *ni = (uint64_t *)realloc(idx->all_ids, sizeof(uint64_t) * (size_t)nc);
+        if (!ni) return PISTADB_ENOMEM;
+        idx->all_ids = ni;
         uint8_t  *nd = (uint8_t  *)realloc(idx->all_deleted, (size_t)nc);
-        if (!ni || !nd) return PISTADB_ENOMEM;
+        if (!nd) return PISTADB_ENOMEM;
+        idx->all_deleted = nd;
         memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
-        idx->all_ids = ni; idx->all_deleted = nd;
         idx->vec_cap = nc;
     }
     int slot = idx->n_vecs++;
@@ -257,18 +261,26 @@ int ivfpq_insert(IVFPQIndex *idx, uint64_t id, const char *label, const float *v
         float d = dist_l2sq(vec, idx->coarse_centroids + (size_t)c * idx->dim, idx->dim);
         if (d < bd) { bd = d; best_c = c; }
     }
-    /* Compute residual */
-    float *res = (float *)malloc(sizeof(float) * (size_t)idx->dim);
-    if (!res) return PISTADB_ENOMEM;
+    /* Compute residual + encode.  Stack-allocate the scratch buffers for the
+     * common embedding-size range (dim ≤ 1024, M ≤ 256); fall back to heap for
+     * larger configurations.  Avoids two malloc/free round-trips per insert. */
+    float  res_stack[1024];
+    uint8_t code_stack[256];
+    float  *res   = (idx->dim <= 1024) ? res_stack
+                                       : (float *)malloc(sizeof(float) * (size_t)idx->dim);
+    uint8_t *codes = (idx->M   <= 256 ) ? code_stack
+                                       : (uint8_t *)malloc((size_t)idx->M);
+    if (!res || !codes) {
+        if (res   != res_stack)  free(res);
+        if (codes != code_stack) free(codes);
+        return PISTADB_ENOMEM;
+    }
     const float *cc = idx->coarse_centroids + (size_t)best_c * idx->dim;
     for (int d = 0; d < idx->dim; d++) res[d] = vec[d] - cc[d];
-    /* Encode */
-    uint8_t *codes = (uint8_t *)malloc((size_t)idx->M);
-    if (!codes) { free(res); return PISTADB_ENOMEM; }
     pq_encode(idx, res, codes);
-    free(res);
     int r = pq_list_push(idx, best_c, id, codes);
-    free(codes);
+    if (res   != res_stack)  free(res);
+    if (codes != code_stack) free(codes);
     return r;
 }
 
@@ -295,11 +307,28 @@ int ivfpq_update(IVFPQIndex *idx, uint64_t id, const float *vec) {
 
 /* ── Search ──────────────────────────────────────────────────────────────── */
 
+/* (id, slot) pair for sorted lookup tables. */
+typedef struct { uint64_t id; int slot; } IdSlot;
+static int idslot_cmp(const void *a, const void *b) {
+    uint64_t ia = ((const IdSlot *)a)->id, ib = ((const IdSlot *)b)->id;
+    return (ia > ib) - (ia < ib);
+}
+/* Binary search for `id` in a sorted IdSlot array; returns slot or -1. */
+static int idslot_find(const IdSlot *arr, int n, uint64_t id) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (arr[mid].id == id) return arr[mid].slot;
+        if (arr[mid].id < id) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
+}
+
 int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
                  PistaDBResult *results) {
-    if (!idx->trained) return 0;
+    if (!idx->trained || k <= 0) return 0;
 
-    /* Find nprobe nearest coarse centroids */
+    /* Find nprobe nearest coarse centroids. */
     float *c_dists = (float *)malloc(sizeof(float) * (size_t)idx->nlist);
     int   *c_order = (int   *)malloc(sizeof(int)   * (size_t)idx->nlist);
     if (!c_dists || !c_order) { free(c_dists); free(c_order); return 0; }
@@ -314,12 +343,46 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
         int t = c_order[i]; c_order[i] = c_order[best]; c_order[best] = t;
     }
 
-    /* Build per-centroid LUT (query residual relative to that centroid) */
-    float *lut = (float *)malloc(sizeof(float) * (size_t)(idx->M * idx->K_sub));
-    float *qres = (float *)malloc(sizeof(float) * (size_t)idx->dim);
-    if (!lut || !qres) { free(c_dists); free(c_order); free(lut); free(qres); return 0; }
+    /* Build a one-time sorted (id → slot) table over live vectors so the
+     * deletion check inside the hot loop is O(log n_vecs) instead of O(n_vecs)
+     * per probed posting. */
+    IdSlot *idmap = NULL;
+    int     idmap_n = 0;
+    if (idx->n_vecs > 0) {
+        idmap = (IdSlot *)malloc(sizeof(IdSlot) * (size_t)idx->n_vecs);
+        if (!idmap) { free(c_dists); free(c_order); return 0; }
+        for (int s = 0; s < idx->n_vecs; s++) {
+            if (idx->all_deleted[s]) continue;
+            idmap[idmap_n].id   = idx->all_ids[s];
+            idmap[idmap_n].slot = s;
+            idmap_n++;
+        }
+        qsort(idmap, (size_t)idmap_n, sizeof(IdSlot), idslot_cmp);
+    }
 
-    Heap heap; heap_init(&heap, k + 4, 1);  /* max-heap */
+    float *lut  = (float *)malloc(sizeof(float) * (size_t)(idx->M * idx->K_sub));
+    float *qres = (float *)malloc(sizeof(float) * (size_t)idx->dim);
+    if (!lut || !qres) {
+        free(c_dists); free(c_order); free(lut); free(qres); free(idmap);
+        return 0;
+    }
+
+    /* After ivfpq_update the same vid lives in two inverted-list postings
+     * (the stale one in the old cluster, the fresh one in the new cluster).
+     * Both map back to the same live slot via idslot_find, which would
+     * surface duplicate ids in the results.  A per-slot bitset ensures each
+     * vector is scored at most once per search. */
+    uint8_t *seen_slot = NULL;
+    if (idx->n_vecs > 0) {
+        seen_slot = (uint8_t *)calloc((size_t)idx->n_vecs, 1);
+        if (!seen_slot) {
+            free(c_dists); free(c_order); free(lut); free(qres); free(idmap);
+            return 0;
+        }
+    }
+
+    /* Heap stores slot in id field so post-processing has O(1) label lookup. */
+    Heap heap; heap_init(&heap, k + 4, 1);
 
     int entry_size = 8 + idx->M;
     for (int pi = 0; pi < idx->nprobe && pi < idx->nlist; pi++) {
@@ -330,39 +393,38 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
 
         const uint8_t *list = idx->pq_lists[c];
         for (int j = 0; j < idx->list_sizes[c]; j++) {
-            const uint8_t *entry = list + (size_t)j * entry_size;
+            const uint8_t *entry = list + (size_t)j * (size_t)entry_size;
             uint64_t vid = *(const uint64_t *)entry;
-            /* Check deleted */
-            int del = 0;
-            for (int s = 0; s < idx->n_vecs; s++) {
-                if (idx->all_ids[s] == vid) { del = idx->all_deleted[s]; break; }
-            }
-            if (del) continue;
+            int slot = idslot_find(idmap, idmap_n, vid);
+            if (slot < 0) continue;  /* deleted or not present */
+            if (seen_slot && seen_slot[slot]) continue;  /* dedupe stale postings */
+            if (seen_slot) seen_slot[slot] = 1;
             float d = pq_adc(idx, lut, entry + 8);
-            if (heap.size < k) heap_push(&heap, d, vid);
-            else if (d < heap_top(&heap).key) { heap_pop(&heap); heap_push(&heap, d, vid); }
+            if (heap.size < k) heap_push(&heap, d, (uint64_t)slot);
+            else if (d < heap_top(&heap).key) {
+                heap_pop(&heap); heap_push(&heap, d, (uint64_t)slot);
+            }
         }
     }
-    free(c_dists); free(c_order); free(lut); free(qres);
+    free(c_dists); free(c_order); free(lut); free(qres); free(idmap); free(seen_slot);
 
     int cnt = heap.size;
-    float *ds = (float    *)malloc(sizeof(float)    * (size_t)cnt);
-    uint64_t *is = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)cnt);
+    if (cnt == 0) { heap_free(&heap); return 0; }
+    float *ds = (float *)malloc(sizeof(float) * (size_t)cnt);
+    int   *ss = (int   *)malloc(sizeof(int)   * (size_t)cnt);
+    if (!ds || !ss) { free(ds); free(ss); heap_free(&heap); return 0; }
     for (int i = cnt - 1; i >= 0; i--) {
         HeapItem it = heap_pop(&heap);
-        ds[i] = it.key; is[i] = it.id;
+        ds[i] = it.key; ss[i] = (int)it.id;
     }
     for (int i = 0; i < cnt; i++) {
-        results[i].id = is[i]; results[i].distance = ds[i];
-        results[i].label[0] = '\0';
-        for (int j = 0; j < idx->n_vecs; j++) {
-            if (idx->all_ids[j] == is[i] && !idx->all_deleted[j]) {
-                strncpy(results[i].label, VS_LABEL(&idx->vs, j), 255);
-                results[i].label[255] = '\0'; break;
-            }
-        }
+        int s = ss[i];
+        results[i].id       = idx->all_ids[s];
+        results[i].distance = ds[i];
+        strncpy(results[i].label, VS_LABEL(&idx->vs, s), 255);
+        results[i].label[255] = '\0';
     }
-    free(ds); free(is); heap_free(&heap);
+    free(ds); free(ss); heap_free(&heap);
     return cnt;
 }
 
@@ -408,14 +470,22 @@ int ivfpq_save(const IVFPQIndex *idx, void **out_buf, size_t *out_size) {
 }
 
 int ivfpq_load(IVFPQIndex *idx, const void *buf, size_t size, int dim, DistFn dist_fn) {
-    const uint8_t *p = (const uint8_t *)buf;
+    const uint8_t *p   = (const uint8_t *)buf;
+    const uint8_t *end = p + size;
 #define RI32() (*(const int32_t*)p); p+=4
 #define RU64() (*(const uint64_t*)p); p+=8
+    if (size < (size_t)(sizeof(int32_t) * 8)) return PISTADB_ECORRUPT;
     int nlist   = RI32(); int file_dim = RI32(); int nprobe = RI32();
     int pq_M    = RI32(); int K_sub= RI32(); int sub_dim= RI32();
     int nbits   = RI32(); int n_vecs = RI32();
-    (void)size; (void)K_sub; (void)sub_dim;
+    (void)K_sub; (void)sub_dim;
     if (file_dim != dim) return PISTADB_ECORRUPT;
+    if (nlist <= 0 || nlist > 1000000 || pq_M <= 0 ||
+        (nbits != 4 && nbits != 8) || n_vecs < 0) return PISTADB_ECORRUPT;
+    /* Centroid + codebook blocks must fit in the remaining buffer. */
+    if ((size_t)(end - p) < sizeof(float) * ((size_t)nlist * (size_t)dim
+                                             + (size_t)pq_M * (size_t)(1 << nbits) * (size_t)(dim / pq_M)))
+        return PISTADB_ECORRUPT;
 
     int r = ivfpq_create(idx, dim, dist_fn, nlist, nprobe, pq_M, nbits);
     if (r != PISTADB_OK) return r;
@@ -431,11 +501,14 @@ int ivfpq_load(IVFPQIndex *idx, const void *buf, size_t size, int dim, DistFn di
         int nc = idx->vec_cap * 2 + 8;
         int rl = vs_ensure(&idx->vs, nc);
         if (rl != PISTADB_OK) return rl;
-        uint64_t *ni = (uint64_t *)realloc(idx->all_ids,     sizeof(uint64_t) * (size_t)nc);
+        uint64_t *ni = (uint64_t *)realloc(idx->all_ids, sizeof(uint64_t) * (size_t)nc);
+        if (!ni) return PISTADB_ENOMEM;
+        idx->all_ids = ni;
         uint8_t  *nd = (uint8_t  *)realloc(idx->all_deleted, (size_t)nc);
-        if (!ni || !nd) return PISTADB_ENOMEM;
+        if (!nd) return PISTADB_ENOMEM;
+        idx->all_deleted = nd;
         memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
-        idx->all_ids = ni; idx->all_deleted = nd; idx->vec_cap = nc;
+        idx->vec_cap = nc;
     }
     for (int i = 0; i < n_vecs; i++) {
         idx->all_ids[i] = RU64();
@@ -446,12 +519,16 @@ int ivfpq_load(IVFPQIndex *idx, const void *buf, size_t size, int dim, DistFn di
 
     int entry_size = 8 + pq_M;
     for (int c = 0; c < nlist; c++) {
+        if ((size_t)(end - p) < 4) return PISTADB_ECORRUPT;
         int ls = RI32();
-        idx->pq_lists[c]    = (uint8_t *)malloc((size_t)(ls + 1) * entry_size);
+        if (ls < 0) return PISTADB_ECORRUPT;
+        if ((size_t)(end - p) < (size_t)ls * (size_t)entry_size) return PISTADB_ECORRUPT;
+        idx->pq_lists[c]    = (uint8_t *)malloc((size_t)(ls + 1) * (size_t)entry_size);
+        if (!idx->pq_lists[c]) return PISTADB_ENOMEM;
         idx->list_caps[c]   = ls + 1;
         idx->list_sizes[c]  = ls;
-        memcpy(idx->pq_lists[c], p, (size_t)ls * entry_size);
-        p += (size_t)ls * entry_size;
+        memcpy(idx->pq_lists[c], p, (size_t)ls * (size_t)entry_size);
+        p += (size_t)ls * (size_t)entry_size;
     }
 #undef RI32
 #undef RU64

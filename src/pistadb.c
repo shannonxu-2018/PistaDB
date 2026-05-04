@@ -137,6 +137,10 @@ static void recompute_n_active(PistaDB *db) {
             for (int i = 0; i < db->idx.ivf.n_vecs; i++)
                 if (!db->idx.ivf.vec_deleted[i]) cnt++;
             break;
+        case INDEX_IVF_PQ:
+            for (int i = 0; i < db->idx.ivfpq.n_vecs; i++)
+                if (!db->idx.ivfpq.all_deleted[i]) cnt++;
+            break;
         case INDEX_LSH:
             for (int i = 0; i < db->idx.lsh.n_vecs; i++)
                 if (!db->idx.lsh.vec_deleted[i]) cnt++;
@@ -164,6 +168,22 @@ static void recompute_n_active(PistaDB *db) {
     db->n_active = cnt;
 }
 
+/* ── Free whichever index variant is currently active ────────────────────── */
+static void free_active_index(PistaDB *db) {
+    switch (db->index_type) {
+        case INDEX_LINEAR:  linear_free(&db->idx.linear);    break;
+        case INDEX_HNSW:    hnsw_free(&db->idx.hnsw);        break;
+        case INDEX_IVF:     ivf_free(&db->idx.ivf);          break;
+        case INDEX_IVF_PQ:  ivfpq_free(&db->idx.ivfpq);      break;
+        case INDEX_DISKANN: diskann_free(&db->idx.diskann);  break;
+        case INDEX_LSH:     lsh_free(&db->idx.lsh);          break;
+        case INDEX_SCANN:   scann_free(&db->idx.scann);      break;
+        case INDEX_SQ:      sq_free(&db->idx.sq);            break;
+        default: break;
+    }
+    memset(&db->idx, 0, sizeof(db->idx));
+}
+
 /* ── Load from file ──────────────────────────────────────────────────────── */
 
 static int load_from_file(PistaDB *db) {
@@ -172,6 +192,15 @@ static int load_from_file(PistaDB *db) {
     if (r != PISTADB_OK) return r;
 
     if ((int)hdr.dimension != db->dim)    return PISTADB_EINVAL;
+
+    /* Snapshot incoming state so we can restore it on failure (and avoid
+     * leaving db in a half-loaded state for the caller's create_index retry). */
+    PistaDBMetric    saved_metric = db->metric;
+    PistaDBIndexType saved_index  = db->index_type;
+    uint64_t         saved_next   = db->next_id;
+    uint64_t         saved_total  = db->n_total;
+    DistFn           saved_dfn    = db->dist_fn;
+
     db->metric     = (PistaDBMetric)hdr.metric_type;
     db->index_type = (PistaDBIndexType)hdr.index_type;
     db->next_id    = hdr.next_id;
@@ -181,7 +210,7 @@ static int load_from_file(PistaDB *db) {
     void *vec_buf = NULL, *idx_buf = NULL;
     size_t vec_sz = 0, idx_sz = 0;
     r = storage_read_sections(db->path, &hdr, &vec_buf, &vec_sz, &idx_buf, &idx_sz);
-    if (r != PISTADB_OK) return r;
+    if (r != PISTADB_OK) goto fail;
 
     DistFn fn = db->dist_fn;
     switch (db->index_type) {
@@ -200,7 +229,13 @@ static int load_from_file(PistaDB *db) {
         case INDEX_DISKANN:
             r = diskann_load(&db->idx.diskann, idx_buf, idx_sz, db->dim, fn);
             /* vec section not used for diskann (vectors embedded in nodes) */
-            if (r != PISTADB_OK) { r = diskann_load(&db->idx.diskann, vec_buf, vec_sz, db->dim, fn); }
+            if (r != PISTADB_OK) {
+                /* The first attempt may have partially initialised the index;
+                 * release it before retrying so we do not leak. */
+                diskann_free(&db->idx.diskann);
+                memset(&db->idx.diskann, 0, sizeof(db->idx.diskann));
+                r = diskann_load(&db->idx.diskann, vec_buf, vec_sz, db->dim, fn);
+            }
             break;
         case INDEX_LSH:
             r = lsh_load(&db->idx.lsh, vec_buf, vec_sz, db->dim, fn, db->metric);
@@ -216,7 +251,20 @@ static int load_from_file(PistaDB *db) {
     }
     free(vec_buf);
     free(idx_buf);
-    if (r == PISTADB_OK) recompute_n_active(db);
+    if (r == PISTADB_OK) {
+        recompute_n_active(db);
+        return PISTADB_OK;
+    }
+    /* Load failed after we mutated db state — release any partial index
+     * allocations and roll the metadata fields back so a fall-through
+     * create_index() starts from a clean slate. */
+    free_active_index(db);
+fail:
+    db->metric     = saved_metric;
+    db->index_type = saved_index;
+    db->next_id    = saved_next;
+    db->n_total    = saved_total;
+    db->dist_fn    = saved_dfn;
     return r;
 }
 
@@ -249,6 +297,11 @@ PistaDB *pistadb_open(const char *path, int dim,
     /* Create fresh index */
     int r = create_index(db);
     if (r != PISTADB_OK) {
+        /* create_index may have partially populated the index union before
+         * failing — release whatever it allocated so we do not leak.  Each
+         * *_create starts with memset(idx,0,...) so the matching *_free is
+         * safe to call even on a partially-initialised state. */
+        free_active_index(db);
         set_err(db, r, err_str(r));
         free(db);
         return NULL;
@@ -258,16 +311,7 @@ PistaDB *pistadb_open(const char *path, int dim,
 
 void pistadb_close(PistaDB *db) {
     if (!db) return;
-    switch (db->index_type) {
-        case INDEX_LINEAR:  linear_free(&db->idx.linear);   break;
-        case INDEX_HNSW:    hnsw_free(&db->idx.hnsw);       break;
-        case INDEX_IVF:     ivf_free(&db->idx.ivf);         break;
-        case INDEX_IVF_PQ:  ivfpq_free(&db->idx.ivfpq);     break;
-        case INDEX_DISKANN: diskann_free(&db->idx.diskann);  break;
-        case INDEX_LSH:     lsh_free(&db->idx.lsh);         break;
-        case INDEX_SCANN:   scann_free(&db->idx.scann);     break;
-        case INDEX_SQ:      sq_free(&db->idx.sq);           break;
-    }
+    free_active_index(db);
     free(db);
 }
 
@@ -449,6 +493,34 @@ int pistadb_get(PistaDB *db, uint64_t id, float *out_vec, char *out_label) {
                 if (out_label) { strncpy(out_label, VS_LABEL(&sq->vs, i), 255); out_label[255] = '\0'; }
                 return PISTADB_OK;
             }
+        }
+    }
+    if (db->index_type == INDEX_SCANN) {
+        /* ScaNN stores the raw float vector inside each inverted-list entry,
+         * so we can reconstruct out_vec exactly.  We have to scan the lists
+         * because there is no global slot→list pointer table. */
+        ScaNNIndex *sn = &db->idx.scann;
+        const int   esz = 8 + sn->pq_M + sn->dim * (int)sizeof(float);
+        for (int slot = 0; slot < sn->n_vecs; slot++) {
+            if (sn->all_deleted[slot] || sn->all_ids[slot] != id) continue;
+            if (out_label) {
+                strncpy(out_label, VS_LABEL(&sn->vs, slot), 255);
+                out_label[255] = '\0';
+            }
+            if (!out_vec) return PISTADB_OK;
+            for (int c = 0; c < sn->nlist; c++) {
+                const uint8_t *list = sn->lists[c];
+                for (int j = 0; j < sn->list_sizes[c]; j++) {
+                    const uint8_t *entry = list + (size_t)j * (size_t)esz;
+                    if (*(const uint64_t *)entry == id) {
+                        memcpy(out_vec, entry + 8 + sn->pq_M,
+                               sizeof(float) * (size_t)sn->dim);
+                        return PISTADB_OK;
+                    }
+                }
+            }
+            /* id was in slot table but not in any inverted list → corrupt */
+            return PISTADB_ECORRUPT;
         }
     }
     return PISTADB_ENOTFOUND;

@@ -26,7 +26,7 @@ import time
 import threading
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "wrap", "python"))
 
 from pistadb import (
     PistaDB, Metric, Index, Params, build_from_array,

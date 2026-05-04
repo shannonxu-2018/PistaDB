@@ -33,31 +33,43 @@ static int random_level(float mL) {
 }
 
 /* ── Node helpers ────────────────────────────────────────────────────────── */
-static int node_init(HNSWNode *n, uint64_t id, int level, int M, int M_max0) {
-    n->vec_id       = id;
-    n->level        = level;
-    n->neighbors    = (int **)calloc((size_t)(level + 1), sizeof(int *));
-    n->neighbor_cnt = (int  *)calloc((size_t)(level + 1), sizeof(int));
-    n->neighbor_cap = (int  *)calloc((size_t)(level + 1), sizeof(int));
-    if (!n->neighbors || !n->neighbor_cnt || !n->neighbor_cap) return PISTADB_ENOMEM;
-
-    for (int i = 0; i <= level; i++) {
-        int cap = (i == 0) ? M_max0 * 2 : M * 2;
-        n->neighbors[i] = (int *)malloc(sizeof(int) * (size_t)cap);
-        if (!n->neighbors[i]) return PISTADB_ENOMEM;
-        n->neighbor_cap[i] = cap;
-        n->neighbor_cnt[i] = 0;
-    }
-    return PISTADB_OK;
-}
-
 static void node_free(HNSWNode *n) {
     if (!n->neighbors) return;
     for (int i = 0; i <= n->level; i++) free(n->neighbors[i]);
     free(n->neighbors);
     free(n->neighbor_cnt);
     free(n->neighbor_cap);
-    n->neighbors = NULL;
+    n->neighbors    = NULL;
+    n->neighbor_cnt = NULL;
+    n->neighbor_cap = NULL;
+}
+
+static int node_init(HNSWNode *n, uint64_t id, int level, int M, int M_max0) {
+    n->vec_id       = id;
+    n->level        = level;
+    n->neighbors    = (int **)calloc((size_t)(level + 1), sizeof(int *));
+    n->neighbor_cnt = (int  *)calloc((size_t)(level + 1), sizeof(int));
+    n->neighbor_cap = (int  *)calloc((size_t)(level + 1), sizeof(int));
+    if (!n->neighbors || !n->neighbor_cnt || !n->neighbor_cap) {
+        node_free(n);
+        return PISTADB_ENOMEM;
+    }
+
+    for (int i = 0; i <= level; i++) {
+        int cap = (i == 0) ? M_max0 * 2 : M * 2;
+        n->neighbors[i] = (int *)malloc(sizeof(int) * (size_t)cap);
+        if (!n->neighbors[i]) {
+            /* Roll back already-allocated layers so they don't leak when the
+             * caller treats this node as never-initialised. */
+            n->level = i - 1;
+            node_free(n);
+            n->level = level;  /* preserve nominal level for caller diagnostics */
+            return PISTADB_ENOMEM;
+        }
+        n->neighbor_cap[i] = cap;
+        n->neighbor_cnt[i] = 0;
+    }
+    return PISTADB_OK;
 }
 
 /* Add neighbor to node at given layer (no duplicate check for speed). */
@@ -75,9 +87,16 @@ static int node_add_neighbor(HNSWNode *n, int layer, int nb_node) {
 
 /* ── Index lifecycle ─────────────────────────────────────────────────────── */
 
+/* HNSW_MAX_M caps the per-layer fan-out so the tmp_nb scratch array used by
+ * hnsw_insert (sized HNSW_MAX_LAYERS * 64 = 3072) cannot overflow.  M_max0 is
+ * 2*M, and select_neighbors writes up to M_max0 entries; 1024 keeps M_max0 at
+ * 2048, well within the buffer. */
+#define HNSW_MAX_M 1024
+
 int hnsw_create(HNSWIndex *idx, int dim, DistFn dist_fn,
                 int M, int ef_construction, int ef_search) {
-    if (M < 2) M = 2;
+    if (M < 2)          M = 2;
+    if (M > HNSW_MAX_M) M = HNSW_MAX_M;
     idx->dim            = dim;
     idx->dist_fn        = dist_fn;
     idx->M              = M;
@@ -345,25 +364,34 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
     }
     search_layer(idx, query, ep, ef, 0, &W, &C, &visited);
 
-    /* Collect results (W is max-heap; drain to get ascending order) */
-    int    cnt = 0;
-    float *dist_buf = (float    *)malloc(sizeof(float)    * (size_t)W.size);
-    int   *node_buf = (int      *)malloc(sizeof(int)      * (size_t)W.size);
-    int    total    = W.size;
-    while (W.size > 0) {
-        HeapItem it = heap_pop(&W);
-        dist_buf[W.size] = it.key;
-        node_buf[W.size] = (int)it.id;
-    }
-    /* dist_buf / node_buf are now in ascending distance order (0..total-1) */
-    for (int i = 0; i < total && cnt < k; i++) {
-        int ni = node_buf[i];
-        if (idx->nodes[ni].vec_id == UINT64_MAX) continue;  /* deleted */
-        results[cnt].id       = idx->nodes[ni].vec_id;
-        results[cnt].distance = dist_buf[i];
-        strncpy(results[cnt].label, VS_LABEL(&idx->vs, ni), 255);
-        results[cnt].label[255] = '\0';
-        cnt++;
+    /* Collect results (W is max-heap; drain to get ascending order). */
+    int   total = W.size;
+    int   cnt   = 0;
+    float *dist_buf = NULL;
+    int   *node_buf = NULL;
+    if (total > 0) {
+        dist_buf = (float *)malloc(sizeof(float) * (size_t)total);
+        node_buf = (int   *)malloc(sizeof(int)   * (size_t)total);
+        if (!dist_buf || !node_buf) {
+            free(dist_buf); free(node_buf);
+            heap_free(&W); heap_free(&C); bitset_free(&visited);
+            return 0;
+        }
+        while (W.size > 0) {
+            HeapItem it = heap_pop(&W);
+            dist_buf[W.size] = it.key;
+            node_buf[W.size] = (int)it.id;
+        }
+        /* dist_buf / node_buf are now in ascending distance order (0..total-1) */
+        for (int i = 0; i < total && cnt < k; i++) {
+            int ni = node_buf[i];
+            if (idx->nodes[ni].vec_id == UINT64_MAX) continue;  /* deleted */
+            results[cnt].id       = idx->nodes[ni].vec_id;
+            results[cnt].distance = dist_buf[i];
+            strncpy(results[cnt].label, VS_LABEL(&idx->vs, ni), 255);
+            results[cnt].label[255] = '\0';
+            cnt++;
+        }
     }
     free(dist_buf); free(node_buf);
     heap_free(&W); heap_free(&C);
@@ -436,14 +464,16 @@ int hnsw_save(const HNSWIndex *idx, void **out_buf, size_t *out_size) {
 
 int hnsw_load(HNSWIndex *idx, const void *buf, size_t size,
               int dim, DistFn dist_fn) {
-    const uint8_t *p = (const uint8_t *)buf;
-    (void)size;
+    const uint8_t *p   = (const uint8_t *)buf;
+    const uint8_t *end = p + size;
 
-/* MSVC-compatible read macros (comma expression, no GCC statement extensions) */
-#define RI32() (p += 4, *(const int32_t *)(p - 4))
-#define RU64() (p += 8, *(const uint64_t*)(p - 8))
-#define RF32() (p += 4, *(const float    *)(p - 4))
+/* Bounds-checked read macros: bail on truncated buffer rather than read OOB. */
+#define NEED(n)  do { if ((size_t)(end - p) < (size_t)(n)) return PISTADB_ECORRUPT; } while (0)
+#define RI32()   (p += 4, *(const int32_t *)(p - 4))
+#define RU64()   (p += 8, *(const uint64_t*)(p - 8))
+#define RF32()   (p += 4, *(const float    *)(p - 4))
 
+    NEED(8 * 4);
     int n_nodes        = RI32();
     int file_dim       = RI32();
     int M              = RI32();
@@ -454,6 +484,13 @@ int hnsw_load(HNSWIndex *idx, const void *buf, size_t size,
     int max_layer      = RI32();
 
     if (file_dim != dim) return PISTADB_ECORRUPT;
+    /* Sanity-bound counts read from disk before using them for allocation.
+     * M and M_max0 must respect the HNSW_MAX_M cap so the tmp_nb scratch
+     * buffer in hnsw_insert cannot overflow when re-indexing. */
+    if (n_nodes < 0 || M < 2 || M > HNSW_MAX_M || M_max0 < 0 || M_max0 > 2 * HNSW_MAX_M ||
+        ef_construction < 0 || ef_search < 0 ||
+        max_layer >= HNSW_MAX_LAYERS) return PISTADB_ECORRUPT;
+    if (ep_node < -1 || ep_node >= n_nodes) return PISTADB_ECORRUPT;
 
     int r = hnsw_create(idx, dim, dist_fn, M, ef_construction, ef_search);
     if (r != PISTADB_OK) return r;
@@ -461,23 +498,32 @@ int hnsw_load(HNSWIndex *idx, const void *buf, size_t size,
     idx->ep_node  = ep_node;
     idx->max_layer= max_layer;
 
-    /* Grow to needed capacity */
-    while (idx->node_cap < n_nodes) hnsw_grow(idx);
+    /* Grow to needed capacity — bail on grow failure instead of crashing later. */
+    while (idx->node_cap < n_nodes) {
+        int gr = hnsw_grow(idx);
+        if (gr != PISTADB_OK) return gr;
+    }
 
     for (int i = 0; i < n_nodes; i++) {
+        NEED(8 + 4 + 256);
         uint64_t vec_id = RU64();
         int      level  = RI32();
+        if (level < 0 || level >= HNSW_MAX_LAYERS) return PISTADB_ECORRUPT;
 
         r = node_init(&idx->nodes[i], vec_id, level, idx->M, idx->M_max0);
         if (r != PISTADB_OK) return r;
         idx->n_nodes++;
 
         memcpy(VS_LABEL(&idx->vs, i), p, 256); p += 256;
+        NEED((size_t)idx->dim * sizeof(float));
         float *v = VS_VEC(&idx->vs, i);
         for (int d = 0; d < idx->dim; d++) v[d] = RF32();
 
         for (int l = 0; l <= level; l++) {
+            NEED(4);
             int cnt = RI32();
+            if (cnt < 0) return PISTADB_ECORRUPT;
+            NEED((size_t)cnt * 4);
             idx->nodes[i].neighbor_cnt[l] = cnt;
             if (cnt > idx->nodes[i].neighbor_cap[l]) {
                 int *nd = (int *)realloc(idx->nodes[i].neighbors[l], sizeof(int) * (size_t)cnt);
@@ -487,11 +533,15 @@ int hnsw_load(HNSWIndex *idx, const void *buf, size_t size,
             }
             for (int j = 0; j < cnt; j++) {
                 int nb = RI32();
-                if (nb < 0 || nb >= n_nodes) nb = 0;
+                /* Refuse silent corruption — an out-of-range neighbor index
+                 * would either point at a different node post-load or trigger
+                 * OOB reads during search.  Bail rather than mutate the data. */
+                if (nb < 0 || nb >= n_nodes) return PISTADB_ECORRUPT;
                 idx->nodes[i].neighbors[l][j] = nb;
             }
         }
     }
+#undef NEED
 #undef RI32
 #undef RU64
 #undef RF32

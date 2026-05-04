@@ -54,7 +54,14 @@ static int table_init(LSHTable *t, int K, int dim, float w, PistaDBMetric metric
     t->proj    = (float *)malloc(sizeof(float) * (size_t)(K * dim));
     t->bias    = (float *)malloc(sizeof(float) * (size_t)K);
     t->buckets = (LSHBucket *)calloc((size_t)t->num_buckets, sizeof(LSHBucket));
-    if (!t->proj || !t->bias || !t->buckets) return PISTADB_ENOMEM;
+    if (!t->proj || !t->bias || !t->buckets) {
+        /* Release whatever did succeed and reset bookkeeping so a later
+         * table_free traverses a sane (zero-bucket) table without crashing. */
+        free(t->proj); free(t->bias); free(t->buckets);
+        t->proj = NULL; t->bias = NULL; t->buckets = NULL;
+        t->num_buckets = 0;
+        return PISTADB_ENOMEM;
+    }
 
     /* Fill projection matrix with Gaussian random values */
     for (int i = 0; i < K * dim; i++) t->proj[i] = pcg_normal(rng);
@@ -74,8 +81,12 @@ static int table_init(LSHTable *t, int K, int dim, float w, PistaDBMetric metric
 
 static void table_free(LSHTable *t) {
     free(t->proj); free(t->bias);
-    for (int b = 0; b < t->num_buckets; b++) free(t->buckets[b].slots);
-    free(t->buckets);
+    if (t->buckets) {
+        for (int b = 0; b < t->num_buckets; b++) free(t->buckets[b].slots);
+        free(t->buckets);
+    }
+    t->proj = NULL; t->bias = NULL; t->buckets = NULL;
+    t->num_buckets = 0;
 }
 
 /* Store internal slot index (not external id) — O(1) lookup during search. */
@@ -134,11 +145,13 @@ static int vec_store_grow_lsh(LSHIndex *idx) {
     int nc = idx->vec_cap * 2 + 8;
     int r = vs_ensure(&idx->vs, nc);
     if (r != PISTADB_OK) return r;
-    uint64_t *ni = (uint64_t *)realloc(idx->vec_ids,     sizeof(uint64_t) * (size_t)nc);
+    uint64_t *ni = (uint64_t *)realloc(idx->vec_ids, sizeof(uint64_t) * (size_t)nc);
+    if (!ni) return PISTADB_ENOMEM;
+    idx->vec_ids = ni;
     uint8_t  *nd = (uint8_t  *)realloc(idx->vec_deleted, (size_t)nc);
-    if (!ni || !nd) return PISTADB_ENOMEM;
+    if (!nd) return PISTADB_ENOMEM;
+    idx->vec_deleted = nd;
     memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
-    idx->vec_ids = ni; idx->vec_deleted = nd;
     idx->vec_cap = nc;
     return PISTADB_OK;
 }
@@ -307,20 +320,28 @@ int lsh_save(const LSHIndex *idx, void **out_buf, size_t *out_size) {
 int lsh_load(LSHIndex *idx, const void *buf, size_t size,
              int dim, DistFn dist_fn, PistaDBMetric metric) {
     const uint8_t *p = (const uint8_t *)buf;
-    (void)size;
+    const uint8_t *end = p + size;
 #define RI32() (*(const int32_t*)p); p+=4
 #define RU64() (*(const uint64_t*)p); p+=8
 #define RF32() (*(const float*)p); p+=4
+    if (size < (size_t)(sizeof(int32_t) * 5 + sizeof(float))) return PISTADB_ECORRUPT;
     int L = RI32(); int K = RI32(); int file_dim = RI32(); int n_vecs = RI32();
     int met = RI32(); float w = RF32();
     (void)met;
     if (file_dim != dim) return PISTADB_ECORRUPT;
+    if (L <= 0 || L > 100000 || K <= 0 || K > 64 || n_vecs < 0)
+        return PISTADB_ECORRUPT;
 
     int r = lsh_create(idx, dim, dist_fn, metric, L, K, w);
     if (r) return r;
 
     /* vector store */
+    if ((size_t)(end - p) < 4) return PISTADB_ECORRUPT;
     int nvs = RI32(); (void)nvs;
+    /* Per-entry bytes: id(8) + deleted(1) + label(256) + vec(dim*4). */
+    const size_t vec_entry_sz = 8 + 1 + 256 + sizeof(float) * (size_t)dim;
+    if ((size_t)n_vecs > (size_t)(end - p) / (vec_entry_sz ? vec_entry_sz : 1))
+        return PISTADB_ECORRUPT;
     for (int i = 0; i < n_vecs; i++) {
         uint64_t id = RU64(); uint8_t del = *p++; const char *lbl = (const char *)p; p += 256;
         const float *vec = (const float *)p; p += sizeof(float) * (size_t)dim;
@@ -328,25 +349,37 @@ int lsh_load(LSHIndex *idx, const void *buf, size_t size,
         if (r) return r;
         idx->vec_deleted[idx->n_vecs - 1] = del;
     }
-    /* re-load table projections and buckets */
+    /* re-load table projections and buckets — verify each section fits in
+     * the remaining buffer before trusting it. */
+    const size_t proj_bytes = sizeof(float) * (size_t)K * (size_t)dim;
+    const size_t bias_bytes = sizeof(float) * (size_t)K;
     for (int l = 0; l < L; l++) {
         LSHTable *t = &idx->tables[l];
-        memcpy(t->proj, p, sizeof(float) * (size_t)(K * dim)); p += sizeof(float) * (size_t)(K * dim);
-        memcpy(t->bias, p, sizeof(float) * (size_t)K);         p += sizeof(float) * (size_t)K;
+        if ((size_t)(end - p) < proj_bytes + bias_bytes + 4) return PISTADB_ECORRUPT;
+        memcpy(t->proj, p, proj_bytes); p += proj_bytes;
+        memcpy(t->bias, p, bias_bytes); p += bias_bytes;
         int nb = RI32();
+        /* num_buckets must be positive and bounded — table_init originally
+         * caps at 1<<16 = 65536, leave generous headroom for older files. */
+        if (nb <= 0 || nb > (1 << 24)) return PISTADB_ECORRUPT;
         /* Re-allocate buckets if needed */
         if (nb != t->num_buckets) {
             for (int b = 0; b < t->num_buckets; b++) free(t->buckets[b].slots);
             free(t->buckets);
             t->buckets = (LSHBucket *)calloc((size_t)nb, sizeof(LSHBucket));
+            if (!t->buckets) { t->num_buckets = 0; return PISTADB_ENOMEM; }
             t->num_buckets = nb;
         } else {
             for (int b = 0; b < nb; b++) { free(t->buckets[b].slots); t->buckets[b].slots=NULL; t->buckets[b].size=t->buckets[b].cap=0; }
         }
         for (int b = 0; b < nb; b++) {
+            if ((size_t)(end - p) < 4) return PISTADB_ECORRUPT;
             int sz = RI32();
+            if (sz < 0) return PISTADB_ECORRUPT;
+            if ((size_t)(end - p) < (size_t)sz * 4) return PISTADB_ECORRUPT;
             if (sz > 0) {
                 t->buckets[b].slots = (int *)malloc(sizeof(int) * (size_t)sz);
+                if (!t->buckets[b].slots) return PISTADB_ENOMEM;
                 t->buckets[b].size = t->buckets[b].cap = sz;
                 for (int j = 0; j < sz; j++) { t->buckets[b].slots[j] = *(const int32_t*)p; p += 4; }
             }

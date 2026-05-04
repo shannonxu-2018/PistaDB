@@ -44,11 +44,15 @@ static int linear_grow(LinearIndex *idx) {
     int nc = idx->cap * 2 + 8;
     int r = vs_ensure(&idx->vs, nc);
     if (r != PISTADB_OK) return r;
-    uint64_t *ni = (uint64_t *)realloc(idx->ids,     sizeof(uint64_t) * (size_t)nc);
+    /* Assign each realloc result back immediately so a later failure cannot
+     * leak the earlier allocation or leave the field dangling. */
+    uint64_t *ni = (uint64_t *)realloc(idx->ids, sizeof(uint64_t) * (size_t)nc);
+    if (!ni) return PISTADB_ENOMEM;
+    idx->ids = ni;
     uint8_t  *nd = (uint8_t  *)realloc(idx->deleted, (size_t)nc);
-    if (!ni || !nd) return PISTADB_ENOMEM;
+    if (!nd) return PISTADB_ENOMEM;
+    idx->deleted = nd;
     memset(nd + idx->cap, 0, (size_t)(nc - idx->cap));
-    idx->ids = ni; idx->deleted = nd;
     idx->cap = nc;
     return PISTADB_OK;
 }
@@ -120,6 +124,13 @@ static void result_insert(PistaDBResult *res, int *cnt, int k,
     }
 }
 
+/* qsort comparator: ascending by distance. */
+static int linear_cmp_result(const void *a, const void *b) {
+    float da = ((const PistaDBResult *)a)->distance;
+    float db = ((const PistaDBResult *)b)->distance;
+    return (da > db) - (da < db);
+}
+
 int linear_search(const LinearIndex *idx, const float *query, int k,
                   PistaDBResult *results) {
     int cnt = 0;
@@ -128,14 +139,10 @@ int linear_search(const LinearIndex *idx, const float *query, int k,
         float d = idx->dist_fn(query, VS_VEC(&idx->vs, i), idx->dim);
         result_insert(results, &cnt, k, idx->ids[i], d, VS_LABEL(&idx->vs, i));
     }
-    /* sort ascending by distance */
-    for (int i = 0; i < cnt - 1; i++) {
-        for (int j = i + 1; j < cnt; j++) {
-            if (results[j].distance < results[i].distance) {
-                PistaDBResult tmp = results[i]; results[i] = results[j]; results[j] = tmp;
-            }
-        }
-    }
+    /* result_insert maintains a max-heap-by-distance shape, so we still need
+     * a final ascending sort.  Use qsort (O(k log k)) instead of the prior
+     * O(k²) bubble sort. */
+    if (cnt > 1) qsort(results, (size_t)cnt, sizeof(PistaDBResult), linear_cmp_result);
     return cnt;
 }
 
@@ -181,12 +188,15 @@ int linear_load(LinearIndex *idx, const void *buf, size_t size,
     int32_t count = *(const int32_t *)p; p += 4;
     int32_t fdim  = *(const int32_t *)p; p += 4;
     if (fdim != dim) return PISTADB_ECORRUPT;
+    if (count < 0) return PISTADB_ECORRUPT;
+
+    /* Validate the file actually carries `count` entries before we allocate. */
+    size_t entry = sizeof(uint64_t) + 1 + 256 + sizeof(float) * (size_t)dim;
+    if ((size_t)count > (size - 8) / (entry ? entry : 1)) return PISTADB_ECORRUPT;
+    if (size < 8 + (size_t)count * entry) return PISTADB_ECORRUPT;
 
     int r = linear_create(idx, dim, dist_fn, count + 8);
     if (r != PISTADB_OK) return r;
-
-    size_t entry = sizeof(uint64_t) + 1 + 256 + sizeof(float) * (size_t)dim;
-    if (size < 8 + (size_t)count * entry) return PISTADB_ECORRUPT;
 
     for (int i = 0; i < count; i++) {
         uint64_t id  = *(const uint64_t *)p; p += 8;

@@ -237,7 +237,11 @@ int scann_create(ScaNNIndex *idx, int dim, DistFn dist_fn, PistaDBMetric metric,
     idx->pq_bits  = pq_bits;
     idx->K_sub    = 1 << pq_bits;
     idx->sub_dim  = dim / pq_M;
-    idx->aq_eta   = aq_eta;
+    /* η is the anisotropic penalty.  Negative values invert the transform
+     * direction and have no defined meaning under the ScaNN paper, so clamp
+     * to the valid [0, ∞) range here rather than letting bad config silently
+     * degrade recall. */
+    idx->aq_eta   = (aq_eta >= 0.0f) ? aq_eta : 0.0f;
     idx->rerank_k = (rerank_k > 0) ? rerank_k : 100;
     idx->vec_cap  = 64;
 
@@ -371,13 +375,14 @@ int scann_insert(ScaNNIndex *idx, uint64_t id, const char *label,
         int nc = idx->vec_cap * 2 + 8;
         int rs = vs_ensure(&idx->vs, nc);
         if (rs != PISTADB_OK) return rs;
-        uint64_t *ni = (uint64_t *)realloc(idx->all_ids,     sizeof(uint64_t) * (size_t)nc);
+        uint64_t *ni = (uint64_t *)realloc(idx->all_ids, sizeof(uint64_t) * (size_t)nc);
+        if (!ni) return PISTADB_ENOMEM;
+        idx->all_ids = ni;
         uint8_t  *nd = (uint8_t  *)realloc(idx->all_deleted, (size_t)nc);
-        if (!ni || !nd) return PISTADB_ENOMEM;
-        memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
-        idx->all_ids     = ni;
+        if (!nd) return PISTADB_ENOMEM;
         idx->all_deleted = nd;
-        idx->vec_cap     = nc;
+        memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
+        idx->vec_cap = nc;
     }
     int slot = idx->n_vecs++;
     idx->all_ids[slot]     = id;
@@ -395,25 +400,36 @@ int scann_insert(ScaNNIndex *idx, uint64_t id, const char *label,
         if (d < bd) { bd = d; best = c; }
     }
 
-    /* Compute residual and apply anisotropic transform */
-    float *raw_r   = (float *)malloc(sizeof(float) * (size_t)idx->dim);
-    float *r_tilde = (float *)malloc(sizeof(float) * (size_t)idx->dim);
-    if (!raw_r || !r_tilde) { free(raw_r); free(r_tilde); return PISTADB_ENOMEM; }
+    /* Compute residual, anisotropic-transform, and encode — all into stack
+     * buffers for the common case (dim ≤ 1024, pq_M ≤ 256).  Avoids three
+     * malloc/free pairs per insert at no readability cost. */
+    float   raw_r_stack[1024];
+    float   tilde_stack[1024];
+    uint8_t code_stack[256];
+    float  *raw_r   = (idx->dim <= 1024) ? raw_r_stack
+                                         : (float *)malloc(sizeof(float) * (size_t)idx->dim);
+    float  *r_tilde = (idx->dim <= 1024) ? tilde_stack
+                                         : (float *)malloc(sizeof(float) * (size_t)idx->dim);
+    uint8_t *codes  = (idx->pq_M <= 256) ? code_stack
+                                         : (uint8_t *)malloc((size_t)idx->pq_M);
+    if (!raw_r || !r_tilde || !codes) {
+        if (raw_r   != raw_r_stack) free(raw_r);
+        if (r_tilde != tilde_stack) free(r_tilde);
+        if (codes   != code_stack)  free(codes);
+        return PISTADB_ENOMEM;
+    }
 
     const float *cc = idx->centroids + (size_t)best * idx->dim;
     for (int d = 0; d < idx->dim; d++) raw_r[d] = vec[d] - cc[d];
     aq_transform(raw_r, vec, idx->dim, idx->aq_eta, r_tilde);
-    free(raw_r);
-
-    /* PQ encode the transformed residual */
-    uint8_t *codes = (uint8_t *)malloc((size_t)idx->pq_M);
-    if (!codes) { free(r_tilde); return PISTADB_ENOMEM; }
     pq_encode(idx, r_tilde, codes);
-    free(r_tilde);
 
     /* Store: code + raw vector (for Phase-2 reranking) */
     int r = list_push(idx, best, id, codes, vec);
-    free(codes);
+
+    if (raw_r   != raw_r_stack) free(raw_r);
+    if (r_tilde != tilde_stack) free(r_tilde);
+    if (codes   != code_stack)  free(codes);
     return r;
 }
 
@@ -445,195 +461,177 @@ int scann_update(ScaNNIndex *idx, uint64_t id, const float *vec) {
 
 /* ── Two-phase search ────────────────────────────────────────────────────── */
 
+/* (id, slot) helper for fast deletion lookup, shared with ivfpq style. */
+typedef struct { uint64_t id; int slot; } ScaNNIdSlot;
+static int scann_idslot_cmp(const void *a, const void *b) {
+    uint64_t ia = ((const ScaNNIdSlot *)a)->id, ib = ((const ScaNNIdSlot *)b)->id;
+    return (ia > ib) - (ia < ib);
+}
+static int scann_idslot_find(const ScaNNIdSlot *arr, int n, uint64_t id) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (arr[mid].id == id) return arr[mid].slot;
+        if (arr[mid].id < id) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
+}
+
 int scann_search(const ScaNNIndex *idx, const float *query, int k,
                  PistaDBResult *results) {
     if (!idx->trained || k <= 0) return 0;
 
-    int dim      = idx->dim;
-    int nlist    = idx->nlist;
-    int nprobe   = (idx->nprobe < nlist) ? idx->nprobe : nlist;
-    int rerank_k = (idx->rerank_k > k)   ? idx->rerank_k : k;
+    const int dim      = idx->dim;
+    const int nlist    = idx->nlist;
+    const int nprobe   = (idx->nprobe < nlist) ? idx->nprobe : nlist;
+    const int rerank_k = (idx->rerank_k > k)   ? idx->rerank_k : k;
 
     /* ── Identify the nprobe nearest coarse centroids ─────────────────── */
     float *c_dists = (float *)malloc(sizeof(float) * (size_t)nlist);
-    int   *c_probe = (int   *)malloc(sizeof(int)   * (size_t)nprobe);
-    int   *c_order = (int   *)malloc(sizeof(int)   * (size_t)nlist);
-    if (!c_dists || !c_probe || !c_order) {
-        free(c_dists); free(c_probe); free(c_order);
-        return 0;
-    }
+    int   *c_probe = (int   *)malloc(sizeof(int)   * (size_t)nlist);
+    if (!c_dists || !c_probe) { free(c_dists); free(c_probe); return 0; }
     for (int c = 0; c < nlist; c++) {
-        c_dists[c] = dist_l2sq(query,
-                               idx->centroids + (size_t)c * dim, dim);
-        c_order[c] = c;
+        c_dists[c] = dist_l2sq(query, idx->centroids + (size_t)c * dim, dim);
+        c_probe[c] = c;
     }
-    /* Partial selection-sort to extract nprobe smallest distances */
     for (int i = 0; i < nprobe; i++) {
         int best = i;
         for (int j = i + 1; j < nlist; j++)
-            if (c_dists[c_order[j]] < c_dists[c_order[best]]) best = j;
-        int t = c_order[i]; c_order[i] = c_order[best]; c_order[best] = t;
+            if (c_dists[c_probe[j]] < c_dists[c_probe[best]]) best = j;
+        int t = c_probe[i]; c_probe[i] = c_probe[best]; c_probe[best] = t;
     }
-    for (int i = 0; i < nprobe; i++) c_probe[i] = c_order[i];
     free(c_dists);
-    free(c_order);
 
-    /* ── Allocate per-query working buffers ───────────────────────────── */
+    /* Sorted (id → slot) over live vectors so deletion checks are O(log N). */
+    ScaNNIdSlot *idmap   = NULL;
+    int          idmap_n = 0;
+    if (idx->n_vecs > 0) {
+        idmap = (ScaNNIdSlot *)malloc(sizeof(ScaNNIdSlot) * (size_t)idx->n_vecs);
+        if (!idmap) { free(c_probe); return 0; }
+        for (int s = 0; s < idx->n_vecs; s++) {
+            if (idx->all_deleted[s]) continue;
+            idmap[idmap_n].id   = idx->all_ids[s];
+            idmap[idmap_n].slot = s;
+            idmap_n++;
+        }
+        qsort(idmap, (size_t)idmap_n, sizeof(ScaNNIdSlot), scann_idslot_cmp);
+    }
+
     float *q_res   = (float *)malloc(sizeof(float) * (size_t)dim);
     float *q_tilde = (float *)malloc(sizeof(float) * (size_t)dim);
-    float *lut     = (float *)malloc(
-                         sizeof(float) * (size_t)(idx->pq_M * idx->K_sub));
+    float *lut     = (float *)malloc(sizeof(float) * (size_t)(idx->pq_M * idx->K_sub));
     if (!q_res || !q_tilde || !lut) {
-        free(c_probe); free(q_res); free(q_tilde); free(lut);
+        free(c_probe); free(idmap); free(q_res); free(q_tilde); free(lut);
         return 0;
     }
 
-    /* ── Phase 1: ADC approximate scoring ────────────────────────────── */
-    /* max-heap: keep the rerank_k smallest approximate distances         */
+    /* ── Phase 1: ADC approximate scoring.
+     * Pack (partition c, in-list index j) into a 64-bit token stored in the
+     * heap's id field.  Phase 2 then decodes c/j directly to fetch the same
+     * entry, eliminating the previous O(probed × n_cand) inner scan.
+     *
+     * scann_update leaves a stale posting in the old partition alongside the
+     * fresh one in the new partition; both vids resolve to the same live
+     * slot.  Track seen slots so we score each vector at most once. */
+    uint8_t *seen_slot = NULL;
+    if (idx->n_vecs > 0) {
+        seen_slot = (uint8_t *)calloc((size_t)idx->n_vecs, 1);
+        if (!seen_slot) {
+            free(c_probe); free(idmap); free(q_res); free(q_tilde); free(lut);
+            return 0;
+        }
+    }
+
     Heap cand_heap;
     if (heap_init(&cand_heap, rerank_k + 4, /*is_max=*/1) != PISTADB_OK) {
-        free(c_probe); free(q_res); free(q_tilde); free(lut);
+        free(c_probe); free(idmap); free(q_res); free(q_tilde); free(lut); free(seen_slot);
         return 0;
     }
 
-    int esz = entry_sz(idx);
+    const int esz = entry_sz(idx);
     for (int pi = 0; pi < nprobe; pi++) {
         int c = c_probe[pi];
         const float *cc = idx->centroids + (size_t)c * dim;
 
-        /* Query residual w.r.t. this centroid */
         for (int d = 0; d < dim; d++) q_res[d] = query[d] - cc[d];
-
-        /* Anisotropic transform of query residual (using query direction) */
         aq_transform(q_res, query, dim, idx->aq_eta, q_tilde);
-
-        /* Pre-compute ADC lookup table for this centroid */
         pq_build_lut(idx, q_tilde, lut);
 
-        /* Score every entry in this partition */
         const uint8_t *list = idx->lists[c];
-        for (int j = 0; j < idx->list_sizes[c]; j++) {
-            const uint8_t *entry = list + (size_t)j * esz;
-            uint64_t vid = *(const uint64_t *)entry;
-
-            /* Skip deleted vectors */
-            int del = 0;
-            for (int s = 0; s < idx->n_vecs; s++) {
-                if (idx->all_ids[s] == vid) { del = idx->all_deleted[s]; break; }
-            }
-            if (del) continue;
+        const int      ls   = idx->list_sizes[c];
+        for (int j = 0; j < ls; j++) {
+            const uint8_t *entry = list + (size_t)j * (size_t)esz;
+            uint64_t vid  = *(const uint64_t *)entry;
+            int      slot = scann_idslot_find(idmap, idmap_n, vid);
+            if (slot < 0) continue;  /* deleted or unknown */
+            if (seen_slot && seen_slot[slot]) continue;  /* dedupe stale postings */
+            if (seen_slot) seen_slot[slot] = 1;
 
             float approx_d = pq_adc(idx, lut, entry + 8);
+            /* token: high 24 bits = c (≤ 2^24 partitions), low 40 bits = j */
+            uint64_t token = ((uint64_t)(uint32_t)c << 40) | (uint64_t)(uint32_t)j;
 
             if (cand_heap.size < rerank_k)
-                heap_push(&cand_heap, approx_d, vid);
+                heap_push(&cand_heap, approx_d, token);
             else if (approx_d < heap_top(&cand_heap).key) {
                 heap_pop(&cand_heap);
-                heap_push(&cand_heap, approx_d, vid);
+                heap_push(&cand_heap, approx_d, token);
             }
         }
     }
-    free(q_res);
-    free(q_tilde);
-    free(lut);
+    free(q_res); free(q_tilde); free(lut); free(c_probe); free(seen_slot);
 
     int n_cand = cand_heap.size;
-    if (n_cand == 0) {
-        heap_free(&cand_heap);
-        free(c_probe);
-        return 0;
-    }
+    if (n_cand == 0) { heap_free(&cand_heap); free(idmap); return 0; }
 
-    /* Drain the heap to obtain candidate ids */
-    uint64_t *cand_ids = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)n_cand);
-    if (!cand_ids) {
-        heap_free(&cand_heap);
-        free(c_probe);
-        return 0;
-    }
-    /* Pop in any order — we only need the set of ids */
-    for (int i = 0; i < n_cand; i++)
-        cand_ids[i] = heap_pop(&cand_heap).id;
-    heap_free(&cand_heap);
-
-    /* ── Phase 2: Exact reranking using stored raw vectors ───────────── */
-    /* All Phase-1 candidates came from the nprobe lists, so we only need
-     * to scan those same lists.  This avoids an O(n) full scan.          */
+    /* ── Phase 2: exact rerank — direct seek to each candidate via token. */
     Heap final_heap;
     if (heap_init(&final_heap, k + 4, /*is_max=*/1) != PISTADB_OK) {
-        free(cand_ids);
-        free(c_probe);
-        return 0;
+        heap_free(&cand_heap); free(idmap); return 0;
     }
 
-    for (int pi = 0; pi < nprobe; pi++) {
-        int c = c_probe[pi];
-        const uint8_t *list = idx->lists[c];
-        for (int j = 0; j < idx->list_sizes[c]; j++) {
-            const uint8_t *entry = list + (size_t)j * esz;
-            uint64_t vid = *(const uint64_t *)entry;
+    while (cand_heap.size > 0) {
+        HeapItem it = heap_pop(&cand_heap);
+        uint64_t token = it.id;
+        int      c = (int)(token >> 40);
+        int      j = (int)(token & 0xFFFFFFFFFFULL);
+        if (c < 0 || c >= nlist || j < 0 || j >= idx->list_sizes[c]) continue;
+        const uint8_t *entry = idx->lists[c] + (size_t)j * (size_t)esz;
+        uint64_t vid  = *(const uint64_t *)entry;
+        int      slot = scann_idslot_find(idmap, idmap_n, vid);
+        if (slot < 0) continue;  /* concurrently deleted, skip */
+        const float *raw_vec = (const float *)(entry + 8 + idx->pq_M);
+        float exact_d = idx->dist_fn(query, raw_vec, dim);
 
-            /* Check if this entry is a Phase-1 candidate */
-            int is_cand = 0;
-            for (int ci = 0; ci < n_cand; ci++) {
-                if (cand_ids[ci] == vid) { is_cand = 1; break; }
-            }
-            if (!is_cand) continue;
-
-            /* Skip deleted */
-            int del = 0;
-            for (int s = 0; s < idx->n_vecs; s++) {
-                if (idx->all_ids[s] == vid) { del = idx->all_deleted[s]; break; }
-            }
-            if (del) continue;
-
-            /* Exact distance using stored raw float vector */
-            const float *raw_vec =
-                (const float *)(entry + 8 + idx->pq_M);
-            float exact_d = idx->dist_fn(query, raw_vec, dim);
-
-            if (final_heap.size < k)
-                heap_push(&final_heap, exact_d, vid);
-            else if (exact_d < heap_top(&final_heap).key) {
-                heap_pop(&final_heap);
-                heap_push(&final_heap, exact_d, vid);
-            }
+        if (final_heap.size < k)
+            heap_push(&final_heap, exact_d, (uint64_t)slot);
+        else if (exact_d < heap_top(&final_heap).key) {
+            heap_pop(&final_heap);
+            heap_push(&final_heap, exact_d, (uint64_t)slot);
         }
     }
-    free(cand_ids);
-    free(c_probe);
+    heap_free(&cand_heap);
+    free(idmap);
 
-    /* Extract results in ascending distance order */
     int cnt = final_heap.size;
-    float    *ds = (float    *)malloc(sizeof(float)    * (size_t)(cnt + 1));
-    uint64_t *is = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)(cnt + 1));
-    if (!ds || !is) {
-        free(ds); free(is);
-        heap_free(&final_heap);
-        return 0;
-    }
+    if (cnt == 0) { heap_free(&final_heap); return 0; }
+    float *ds = (float *)malloc(sizeof(float) * (size_t)cnt);
+    int   *ss = (int   *)malloc(sizeof(int)   * (size_t)cnt);
+    if (!ds || !ss) { free(ds); free(ss); heap_free(&final_heap); return 0; }
     for (int i = cnt - 1; i >= 0; i--) {
         HeapItem it = heap_pop(&final_heap);
-        ds[i] = it.key;
-        is[i] = it.id;
+        ds[i] = it.key; ss[i] = (int)it.id;
     }
     heap_free(&final_heap);
 
-    /* Fill output results with labels */
     for (int i = 0; i < cnt; i++) {
-        results[i].id       = is[i];
+        int s = ss[i];
+        results[i].id       = idx->all_ids[s];
         results[i].distance = ds[i];
-        results[i].label[0] = '\0';
-        for (int j = 0; j < idx->n_vecs; j++) {
-            if (idx->all_ids[j] == is[i] && !idx->all_deleted[j]) {
-                strncpy(results[i].label, VS_LABEL(&idx->vs, j), 255);
-                results[i].label[255] = '\0';
-                break;
-            }
-        }
+        strncpy(results[i].label, VS_LABEL(&idx->vs, s), 255);
+        results[i].label[255] = '\0';
     }
-    free(ds);
-    free(is);
+    free(ds); free(ss);
     return cnt;
 }
 
@@ -694,12 +692,13 @@ int scann_save(const ScaNNIndex *idx, void **out_buf, size_t *out_size) {
 int scann_load(ScaNNIndex *idx, const void *buf, size_t size,
                int dim, DistFn dist_fn, PistaDBMetric metric) {
     const uint8_t *p = (const uint8_t *)buf;
-    (void)size;
 
 #define RI32() (*(const int32_t  *)p); p += 4
 #define RF32() (*(const float    *)p); p += 4
 #define RU64() (*(const uint64_t *)p); p += 8
 
+    /* Header is 13 int32 + 1 float32 = 56 bytes. */
+    if (size < (size_t)(sizeof(int32_t) * 13 + sizeof(float))) return PISTADB_ECORRUPT;
     int nlist    = RI32(); int file_dim = RI32(); int nprobe   = RI32();
     int pq_M     = RI32(); int K_sub    = RI32(); int sub_dim  = RI32();
     int pq_bits  = RI32(); int n_vecs   = RI32(); int rerank_k = RI32();
@@ -709,6 +708,9 @@ int scann_load(ScaNNIndex *idx, const void *buf, size_t size,
     (void)K_sub; (void)sub_dim;
 
     if (file_dim != dim) return PISTADB_ECORRUPT;
+    if (nlist <= 0 || nlist > 1000000 || pq_M <= 0 ||
+        (pq_bits != 4 && pq_bits != 8) || n_vecs < 0)
+        return PISTADB_ECORRUPT;
 
     PistaDBMetric stored_metric = (PistaDBMetric)met_raw;
     /* Use the stored metric if it differs (database overrides caller) */
@@ -731,11 +733,14 @@ int scann_load(ScaNNIndex *idx, const void *buf, size_t size,
         if (rl != PISTADB_OK) return rl;
         while (idx->vec_cap < n_vecs) {
             int nc = idx->vec_cap * 2 + 8;
-            uint64_t *ni = (uint64_t *)realloc(idx->all_ids,     sizeof(uint64_t) * (size_t)nc);
+            uint64_t *ni = (uint64_t *)realloc(idx->all_ids, sizeof(uint64_t) * (size_t)nc);
+            if (!ni) return PISTADB_ENOMEM;
+            idx->all_ids = ni;
             uint8_t  *nd = (uint8_t  *)realloc(idx->all_deleted, (size_t)nc);
-            if (!ni || !nd) return PISTADB_ENOMEM;
+            if (!nd) return PISTADB_ENOMEM;
+            idx->all_deleted = nd;
             memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
-            idx->all_ids = ni; idx->all_deleted = nd; idx->vec_cap = nc;
+            idx->vec_cap = nc;
         }
     }
     for (int i = 0; i < n_vecs; i++) {
@@ -746,14 +751,18 @@ int scann_load(ScaNNIndex *idx, const void *buf, size_t size,
     idx->n_vecs = n_vecs;
 
     int esz = entry_sz(idx);
+    const uint8_t *end = (const uint8_t *)buf + size;
     for (int c = 0; c < nlist; c++) {
+        if ((size_t)(end - p) < 4) return PISTADB_ECORRUPT;
         int ls = RI32();
-        idx->lists[c]     = (uint8_t *)malloc((size_t)((ls + 1) * esz));
+        if (ls < 0) return PISTADB_ECORRUPT;
+        if ((size_t)(end - p) < (size_t)ls * (size_t)esz) return PISTADB_ECORRUPT;
+        idx->lists[c]     = (uint8_t *)malloc((size_t)(ls + 1) * (size_t)esz);
+        if (!idx->lists[c]) return PISTADB_ENOMEM;
         idx->list_caps[c] = ls + 1;
         idx->list_sizes[c]= ls;
-        if (!idx->lists[c]) return PISTADB_ENOMEM;
-        memcpy(idx->lists[c], p, (size_t)ls * esz);
-        p += (size_t)ls * esz;
+        memcpy(idx->lists[c], p, (size_t)ls * (size_t)esz);
+        p += (size_t)ls * (size_t)esz;
     }
 
 #undef RI32

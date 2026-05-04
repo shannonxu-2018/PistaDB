@@ -106,6 +106,10 @@ int ivf_train(IVFIndex *idx, const float *vecs, int n_train, int max_iter) {
     /* Lloyd's algorithm */
     int *assign = (int *)malloc(sizeof(int) * (size_t)n_train);
     if (!assign) return PISTADB_ENOMEM;
+    /* Initialise to a sentinel so the iter-0 "did anything change?" comparison
+     * does not read uninitialised memory (UB). Any value < 0 works since real
+     * cluster ids are in [0, nlist). */
+    memset(assign, -1, sizeof(int) * (size_t)n_train);
 
     float *new_C = (float *)calloc((size_t)(nlist * dim), sizeof(float));
     int   *cnt   = (int   *)calloc((size_t)nlist, sizeof(int));
@@ -155,11 +159,13 @@ static int vec_store_grow(IVFIndex *idx) {
     int nc = idx->vec_cap * 2 + 8;
     int r = vs_ensure(&idx->vs, nc);
     if (r != PISTADB_OK) return r;
-    uint64_t *ni = (uint64_t *)realloc(idx->vec_ids,    sizeof(uint64_t) * (size_t)nc);
+    uint64_t *ni = (uint64_t *)realloc(idx->vec_ids, sizeof(uint64_t) * (size_t)nc);
+    if (!ni) return PISTADB_ENOMEM;
+    idx->vec_ids = ni;
     uint8_t  *nd = (uint8_t  *)realloc(idx->vec_deleted, (size_t)nc);
-    if (!ni || !nd) return PISTADB_ENOMEM;
+    if (!nd) return PISTADB_ENOMEM;
+    idx->vec_deleted = nd;
     memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
-    idx->vec_ids = ni; idx->vec_deleted = nd;
     idx->vec_cap = nc;
     return PISTADB_OK;
 }
@@ -237,11 +243,10 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
         int tmp = c_order[i]; c_order[i] = c_order[best]; c_order[best] = tmp;
     }
 
-    /* Scan selected centroids and collect k-best */
-    /* Use a max-heap of size k */
-    Heap heap; heap_init(&heap, k + 4, 1);
-    char labels_buf[256];
-
+    /* Scan selected centroids and collect k-best.  We store the internal
+     * slot in heap.id so the post-processing step below can look up id and
+     * label directly without an O(n_vecs) linear scan per result. */
+    Heap heap; heap_init(&heap, k + 4, 1);  /* max-heap */
     for (int pi = 0; pi < idx->nprobe && pi < idx->nlist; pi++) {
         int c = c_order[pi];
         for (int j = 0; j < idx->list_sizes[c]; j++) {
@@ -249,39 +254,34 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
             if (idx->vec_deleted[p.slot]) continue;
             float d = idx->dist_fn(query, VS_VEC(&idx->vs, p.slot), idx->dim);
             if (heap.size < k) {
-                heap_push(&heap, d, p.id);
+                heap_push(&heap, d, (uint64_t)p.slot);
             } else if (d < heap_top(&heap).key) {
                 heap_pop(&heap);
-                heap_push(&heap, d, p.id);
+                heap_push(&heap, d, (uint64_t)p.slot);
             }
         }
     }
     free(c_dists); free(c_order);
 
     int cnt = heap.size;
-    /* Drain heap into results (ascending order) */
-    float *ds = (float    *)malloc(sizeof(float)    * (size_t)cnt);
-    uint64_t *is = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)cnt);
+    if (cnt == 0) { heap_free(&heap); return 0; }
+    /* Drain max-heap to obtain ascending distance order. */
+    float *ds = (float *)malloc(sizeof(float) * (size_t)cnt);
+    int   *ss = (int   *)malloc(sizeof(int)   * (size_t)cnt);
+    if (!ds || !ss) { free(ds); free(ss); heap_free(&heap); return 0; }
     for (int i = cnt - 1; i >= 0; i--) {
         HeapItem it = heap_pop(&heap);
-        ds[i] = it.key; is[i] = it.id;
+        ds[i] = it.key; ss[i] = (int)it.id;
     }
     for (int i = 0; i < cnt; i++) {
-        results[i].id       = is[i];
+        int s = ss[i];
+        results[i].id       = idx->vec_ids[s];
         results[i].distance = ds[i];
-        /* Fetch label */
-        results[i].label[0] = '\0';
-        for (int j = 0; j < idx->n_vecs; j++) {
-            if (idx->vec_ids[j] == is[i] && !idx->vec_deleted[j]) {
-                strncpy(results[i].label, VS_LABEL(&idx->vs, j), 255);
-                results[i].label[255] = '\0';
-                break;
-            }
-        }
+        strncpy(results[i].label, VS_LABEL(&idx->vs, s), 255);
+        results[i].label[255] = '\0';
     }
-    free(ds); free(is);
+    free(ds); free(ss);
     heap_free(&heap);
-    (void)labels_buf;
     return cnt;
 }
 
@@ -342,13 +342,17 @@ int ivf_load(IVFIndex *idx, const void *buf, size_t size, int dim, DistFn dist_f
 #define RI32() (*(const int32_t*)p); p+=4
 #define RU64() (*(const uint64_t*)p); p+=8
 
+    if (size < (size_t)(sizeof(int32_t) * 5)) return PISTADB_ECORRUPT;
     int nlist    = RI32();
     int file_dim     = RI32();
     int nprobe   = RI32();
     int trained  = RI32();
     int n_vecs   = RI32();
     if (file_dim != dim) return PISTADB_ECORRUPT;
-    (void)end;
+    if (nlist <= 0 || nlist > 1000000 || n_vecs < 0) return PISTADB_ECORRUPT;
+    /* Centroid block must fit in the remaining buffer. */
+    if ((size_t)(end - p) < sizeof(float) * (size_t)nlist * (size_t)dim)
+        return PISTADB_ECORRUPT;
 
     int r = ivf_create(idx, dim, dist_fn, nlist, nprobe);
     if (r != PISTADB_OK) return r;
@@ -370,8 +374,13 @@ int ivf_load(IVFIndex *idx, const void *buf, size_t size, int dim, DistFn dist_f
     /* Reset lists */
     for (int c = 0; c < nlist; c++) { free(idx->lists[c]); idx->lists[c] = NULL; idx->list_sizes[c] = idx->list_caps[c] = 0; }
     for (int c = 0; c < nlist; c++) {
+        if ((size_t)(end - p) < 4) return PISTADB_ECORRUPT;
         int ls = RI32();
+        if (ls < 0) return PISTADB_ECORRUPT;
+        const size_t posting_bytes = (size_t)ls * (sizeof(uint64_t) + sizeof(int32_t));
+        if ((size_t)(end - p) < posting_bytes) return PISTADB_ECORRUPT;
         idx->lists[c]      = (IVFPosting *)malloc(sizeof(IVFPosting) * (size_t)(ls + 1));
+        if (!idx->lists[c]) return PISTADB_ENOMEM;
         idx->list_caps[c]  = ls + 1;
         idx->list_sizes[c] = ls;
         for (int j = 0; j < ls; j++) {

@@ -159,13 +159,20 @@ static int node_add_nb(DiskANNNode *n, int nb) {
 }
 
 static void node_set_neighbors(DiskANNNode *n, const int *nb, int cnt) {
-    n->neighbor_cnt = cnt;
     if (cnt > n->neighbor_cap) {
+        int *new_nb = (int *)malloc(sizeof(int) * (size_t)cnt);
+        if (!new_nb) {
+            /* Allocation failed — keep the old buffer intact and the count
+             * truthful (do not mutate neighbor_cnt to a value the buffer can't
+             * back, which would lead to OOB reads in greedy_search). */
+            return;
+        }
         free(n->neighbors);
-        n->neighbors = (int *)malloc(sizeof(int) * (size_t)cnt);
+        n->neighbors    = new_nb;
         n->neighbor_cap = cnt;
     }
-    if (n->neighbors) memcpy(n->neighbors, nb, sizeof(int) * (size_t)cnt);
+    n->neighbor_cnt = cnt;
+    if (cnt > 0) memcpy(n->neighbors, nb, sizeof(int) * (size_t)cnt);
 }
 
 /* ── Insert ──────────────────────────────────────────────────────────────── */
@@ -358,25 +365,31 @@ int diskann_search(DiskANNIndex *idx, const float *query, int k,
 
     greedy_search(idx, query, idx->medoid, L, &result, &visited);
 
-    /* Collect results ascending */
     int total = result.size;
-    float *ds = (float    *)malloc(sizeof(float)    * (size_t)total);
-    int   *ns = (int      *)malloc(sizeof(int)      * (size_t)total);
-    for (int i = total - 1; i >= 0; i--) {
-        HeapItem it = heap_pop(&result);
-        ds[i] = it.key; ns[i] = (int)it.id;
+    int cnt   = 0;
+    if (total > 0) {
+        float *ds = (float *)malloc(sizeof(float) * (size_t)total);
+        int   *ns = (int   *)malloc(sizeof(int)   * (size_t)total);
+        if (!ds || !ns) {
+            free(ds); free(ns);
+            heap_free(&result); bitset_free(&visited);
+            return 0;
+        }
+        /* Drain max-heap into ascending order. */
+        for (int i = total - 1; i >= 0; i--) {
+            HeapItem it = heap_pop(&result);
+            ds[i] = it.key; ns[i] = (int)it.id;
+        }
+        for (int i = 0; i < total && cnt < k; i++) {
+            if (idx->nodes[ns[i]].deleted) continue;
+            results[cnt].id       = idx->nodes[ns[i]].vec_id;
+            results[cnt].distance = ds[i];
+            strncpy(results[cnt].label, VS_LABEL(&idx->vs, ns[i]), 255);
+            results[cnt].label[255] = '\0';
+            cnt++;
+        }
+        free(ds); free(ns);
     }
-
-    int cnt = 0;
-    for (int i = 0; i < total && cnt < k; i++) {
-        if (idx->nodes[ns[i]].deleted) continue;
-        results[cnt].id       = idx->nodes[ns[i]].vec_id;
-        results[cnt].distance = ds[i];
-        strncpy(results[cnt].label, VS_LABEL(&idx->vs, ns[i]), 255);
-        results[cnt].label[255] = '\0';
-        cnt++;
-    }
-    free(ds); free(ns);
     heap_free(&result);
     bitset_free(&visited);
     return cnt;
@@ -428,34 +441,51 @@ int diskann_load(DiskANNIndex *idx, const void *buf, size_t size,
                  int dim, DistFn dist_fn) {
     /* Minimum header size: 5 int32 + 1 float = 24 bytes */
     if (size < sizeof(int32_t) * 5 + sizeof(float)) return PISTADB_ECORRUPT;
-    const uint8_t *p = (const uint8_t *)buf;
-#define RI32() (*(const int32_t*)p); p+=4
-#define RU64() (*(const uint64_t*)p); p+=8
-#define RF32() (*(const float*)p); p+=4
+    const uint8_t *p   = (const uint8_t *)buf;
+    const uint8_t *end = p + size;
+#define NEED(n) do { if ((size_t)(end - p) < (size_t)(n)) return PISTADB_ECORRUPT; } while (0)
+#define RI32()  (p += 4, *(const int32_t *)(p - 4))
+#define RU64()  (p += 8, *(const uint64_t*)(p - 8))
+#define RF32()  (p += 4, *(const float   *)(p - 4))
     int n_nodes = RI32(); int file_dim = RI32(); int R = RI32(); int L = RI32(); int medoid = RI32();
     float alpha = RF32();
     if (file_dim != dim) return PISTADB_ECORRUPT;
+    if (n_nodes < 0 || R < 0 || L < 0) return PISTADB_ECORRUPT;
+    if (medoid < -1 || medoid >= n_nodes) return PISTADB_ECORRUPT;
 
     int r = diskann_create(idx, dim, dist_fn, R, L, alpha);
     if (r) return r;
     idx->medoid = medoid;
-    while (idx->node_cap < n_nodes) da_grow(idx);
+    while (idx->node_cap < n_nodes) {
+        int gr = da_grow(idx);
+        if (gr != PISTADB_OK) return gr;
+    }
 
     for (int i = 0; i < n_nodes; i++) {
+        NEED(8 + 4 + 4 + 256 + (size_t)dim * sizeof(float));
         uint64_t vid = RU64();
         int del = RI32();
         int nc  = RI32();
+        if (nc < 0) return PISTADB_ECORRUPT;
         idx->nodes[i].vec_id = vid;
         idx->nodes[i].deleted = del;
         idx->nodes[i].neighbor_cnt = nc;
         idx->nodes[i].neighbor_cap = nc + 4;
         idx->nodes[i].neighbors = (int *)malloc(sizeof(int) * (size_t)(nc + 4));
+        if (!idx->nodes[i].neighbors) return PISTADB_ENOMEM;
         memcpy(VS_LABEL(&idx->vs, i), p, 256); p += 256;
         memcpy(VS_VEC(&idx->vs, i), p, sizeof(float) * (size_t)dim);
         p += sizeof(float) * (size_t)dim;
-        for (int j = 0; j < nc; j++) { idx->nodes[i].neighbors[j] = *(const int32_t*)p; p += 4; }
+        NEED((size_t)nc * 4);
+        for (int j = 0; j < nc; j++) {
+            int nb = *(const int32_t*)p; p += 4;
+            /* Refuse silent corruption — see hnsw_load for rationale. */
+            if (nb < 0 || nb >= n_nodes) return PISTADB_ECORRUPT;
+            idx->nodes[i].neighbors[j] = nb;
+        }
         idx->n_nodes++;
     }
+#undef NEED
 #undef RI32
 #undef RU64
 #undef RF32

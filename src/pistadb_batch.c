@@ -359,10 +359,14 @@ void pistadb_batch_destroy(PistaDBBatch *b) {
     /* Drain any remaining items first. */
     pistadb_batch_flush(b);
 
-    /* Signal all workers to exit once the queue stays empty. */
+    /* Signal all workers to exit once the queue stays empty.  Also wake any
+     * producer that may be parked on q_not_full — without this broadcast the
+     * producer would block forever, since shutdown is checked under that
+     * predicate but the cond is otherwise only signalled by the worker drain. */
     pdb_mutex_lock(&b->q_mu);
     b->shutdown = 1;
     pdb_cond_broadcast(&b->q_not_empty);
+    pdb_cond_broadcast(&b->q_not_full);
     pdb_mutex_unlock(&b->q_mu);
 
     for (int i = 0; i < b->n_threads; i++)
