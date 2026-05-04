@@ -7,6 +7,10 @@
 /build/
 
 # ── C / C++ compiled artifacts ───────────────────────────────────────────────
+# These globs also cover everything under /libs/<os>/<arch>/ — the per-OS
+# build scripts in scripts/<os>/ produce binaries there, but only the
+# directory layout (libs/README.md, libs/.gitkeep) is committed; each user
+# or deployment target rebuilds the actual .dll / .so / .dylib locally.
 *.o
 *.obj
 *.a

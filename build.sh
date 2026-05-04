@@ -1,32 +1,20 @@
 #!/usr/bin/env bash
-# PistaDB build script
-# Usage: bash build.sh [Release|Debug]
+# Backward-compatible forwarder. Dispatches to the per-OS script under
+#   scripts/<os>/build.sh
+# which additionally copies artifacts into libs/<os>/<arch>/.
+# See scripts/README.md and INTEGRATION.md for the full per-OS layout.
 set -e
 
-BUILD_TYPE=${1:-Release}
-BUILD_DIR="build"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "=== PistaDB Build ==="
-echo "Build type: $BUILD_TYPE"
-echo "CMake: $(cmake --version | head -1)"
-
-cmake -B "$BUILD_DIR" \
-      -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-      -DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=ON
-
-cmake --build "$BUILD_DIR" --config "$BUILD_TYPE" -j
-
-echo ""
-echo "=== Build complete ==="
-echo "Shared library:"
-find "$BUILD_DIR" -name "*.dll" -o -name "*.so" -o -name "*.dylib" 2>/dev/null | head -5
-
-echo ""
-echo "To install the Python package:"
-echo "  pip install -e wrap/python/"
-echo ""
-echo "To run tests:"
-echo "  PISTADB_LIB_DIR=build/Release pytest tests/ -v"
-echo ""
-echo "To run the example:"
-echo "  PISTADB_LIB_DIR=build/Release python examples/example.py"
+case "$(uname -s)" in
+    Linux*)   exec bash "$SCRIPT_DIR/scripts/linux/build.sh"  "$@" ;;
+    Darwin*)  exec bash "$SCRIPT_DIR/scripts/macos/build.sh"  "$@" ;;
+    MINGW*|MSYS*|CYGWIN*)
+        # Bash on Windows — defer to the .bat for proper MSVC integration.
+        exec cmd.exe //c "$SCRIPT_DIR/scripts/windows/build.bat" "$@" ;;
+    *)
+        echo "Unsupported host OS '$(uname -s)'." >&2
+        echo "Available scripts: scripts/{windows,linux,macos}/build.{bat,sh}" >&2
+        exit 2 ;;
+esac

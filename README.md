@@ -120,21 +120,36 @@ PistaDB is purpose-built for **local RAG pipelines, offline AI agents, privacy-s
 
 **Windows (MSVC):**
 ```bat
-build.bat Release
+scripts\windows\build.bat Release
 ```
 
-**Linux / macOS (GCC / Clang):**
+**Linux (GCC / Clang):**
 ```bash
-bash build.sh Release
+bash scripts/linux/build.sh Release
 ```
 
-Produces `pistadb.dll` (Windows) or `libpistadb.so` (Linux / macOS) with **zero external dependencies**.
+**macOS (Apple Clang):**
+```bash
+bash scripts/macos/build.sh Release
+```
+
+Each script auto-detects the host architecture and copies the artifact into
+`libs/<os>/<arch>/` (e.g. `libs/linux/x86_64/libpistadb.so`). The legacy
+`build.bat` / `build.sh` at the repo root still work — they forward to the
+per-OS scripts. Produced library has **zero external dependencies**.
 
 ### 2. Install the Python Binding
 
 ```bash
 pip install -e wrap/python/
 ```
+
+The wrapper auto-discovers `libs/<os>/<arch>/` at import time, so no
+environment variable is required when working inside this checkout.
+
+> **Using PistaDB from a separate Python project?** See
+> [INTEGRATION.md](INTEGRATION.md) for the end-to-end Linux deployment flow
+> (vendoring, `PISTADB_LIB_DIR` / `PISTADB_LIB_PATH`, Docker recipe).
 
 No Rust compiler. No CMake for the Python step. No surprises.
 

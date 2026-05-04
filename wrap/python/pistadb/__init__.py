@@ -41,7 +41,25 @@ import numpy as np
 # ── Locate the shared library ─────────────────────────────────────────────────
 
 def _find_lib() -> ctypes.CDLL:
-    """Search for pistadb shared library in common locations."""
+    """Search for pistadb shared library in common locations.
+
+    Resolution order (first hit wins):
+      1. ``PISTADB_LIB_PATH`` env var — absolute path to a single library file
+      2. ``PISTADB_LIB_DIR``  env var — directory containing the library
+      3. The Python package directory itself (vendored install)
+      4. ``<repo>/libs/<os>/<arch>/`` — output of ``scripts/<os>/build.*``
+      5. ``<repo>/build/`` and its config-specific subdirs (dev workflow)
+      6. System paths: ``/usr/local/lib``, ``/usr/lib``
+    """
+    # Highest-priority escape hatch: one explicit absolute file path.
+    if "PISTADB_LIB_PATH" in os.environ:
+        explicit = os.environ["PISTADB_LIB_PATH"]
+        if not os.path.isfile(explicit):
+            raise OSError(
+                f"PISTADB_LIB_PATH points to a missing file: {explicit!r}"
+            )
+        return ctypes.CDLL(explicit)
+
     system = platform.system()
     if system == "Windows":
         names = ["pistadb.dll", "libpistadb.dll"]
@@ -50,18 +68,39 @@ def _find_lib() -> ctypes.CDLL:
     else:
         names = ["libpistadb.so", "libpistadb.so.1"]
 
-    # Search order: env var → adjacent build dirs → package dir
-    search_dirs = []
+    # Map the runtime OS / arch to the layout produced by scripts/<os>/build.*
+    os_name = {"Windows": "windows", "Linux": "linux", "Darwin": "macos"}.get(
+        system, system.lower()
+    )
+    arch_raw = platform.machine()
+    arch = {
+        "AMD64":   "x64",
+        "x86_64":  "x86_64",
+        "arm64":   "arm64",
+        "aarch64": "aarch64",
+    }.get(arch_raw, arch_raw)
+
+    pkg_dir = Path(__file__).parent
+    # pkg_dir = <repo>/wrap/python/pistadb  →  parents[2] = <repo>
+    repo_root = pkg_dir.parents[2]
+
+    search_dirs: list[str] = []
     if "PISTADB_LIB_DIR" in os.environ:
         search_dirs.append(os.environ["PISTADB_LIB_DIR"])
 
-    pkg_dir = Path(__file__).parent
     search_dirs += [
+        # Vendored install (e.g. cp libpistadb.so wrap/python/pistadb/).
         str(pkg_dir),
-        str(pkg_dir.parent.parent / "build"),
-        str(pkg_dir.parent.parent / "build" / "Release"),
-        str(pkg_dir.parent.parent / "build" / "Debug"),
-        str(pkg_dir.parent.parent / "build" / "RelWithDebInfo"),
+        # Output of the per-OS scripts in scripts/<os>/build.*
+        str(repo_root / "libs" / os_name / arch),
+        # Generic libs/<os>/ fallback (e.g. macOS where users may symlink a
+        # universal binary into libs/macos/ rather than an arch subdir).
+        str(repo_root / "libs" / os_name),
+        # Direct CMake output for the in-tree dev workflow.
+        str(repo_root / "build"),
+        str(repo_root / "build" / "Release"),
+        str(repo_root / "build" / "Debug"),
+        str(repo_root / "build" / "RelWithDebInfo"),
         "/usr/local/lib",
         "/usr/lib",
     ]
@@ -76,9 +115,13 @@ def _find_lib() -> ctypes.CDLL:
                     continue
 
     raise OSError(
-        "PistaDB shared library not found. "
-        "Build with CMake first (cmake -B build && cmake --build build), "
-        "or set the PISTADB_LIB_DIR environment variable."
+        "PistaDB shared library not found. Tried:\n  "
+        + "\n  ".join(os.path.join(d, names[0]) for d in search_dirs)
+        + "\n\nBuild with one of:"
+        + "\n  bash scripts/linux/build.sh         (Linux)"
+        + "\n  bash scripts/macos/build.sh         (macOS)"
+        + "\n  scripts\\windows\\build.bat          (Windows)"
+        + "\nor set PISTADB_LIB_DIR / PISTADB_LIB_PATH."
     )
 
 
