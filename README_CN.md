@@ -265,6 +265,172 @@ with PistaDB("docs.pst", dim=768, metric=Metric.COSINE) as db:
 
 ---
 
+## 基于 Schema 的集合（Milvus 风格）
+
+基础 `PistaDB` API 存储 `(id, label, vector)` 三元组——当元数据可以装进
+256 字节的 label 时已经够用。如果你需要在向量之上承载**多个带类型的字段**
+（章节、键名、语言、行号、token 数等），可以使用 **`Collection`** 层提供的
+Milvus 兼容 schema API：
+
+- **`FieldSchema` / `CollectionSchema` / `DataType`**——声明 INT64、VARCHAR、
+  FLOAT、DOUBLE、BOOL、JSON、FLOAT_VECTOR 字段，`is_primary` / `auto_id` /
+  `max_length` / `dim` 语义与 `pymilvus` 一一对应。
+- **`Collection.insert(rows)`**——接收以字段名为键的字典列表，自动校验类型与
+  长度；当 `auto_id=True` 时自动生成主键。
+- **`Collection.search(query, k, output_fields=…)`**——返回带有指定标量列的
+  搜索命中结果。
+- **JSON 边车文件（`<path>.meta.json`）**——向量保留在 `.pst` 中，标量字段写入
+  同名 JSON 文件，所有语言共享同一份 wire 格式，跨语言读写完全互通。
+
+```python
+import numpy as np
+from pistadb import (
+    FieldSchema, DataType, create_collection,
+    Metric, Index,
+)
+
+fields = [
+    FieldSchema("lc_id",      DataType.INT64,        is_primary=True, auto_id=True),
+    FieldSchema("lc_section", DataType.VARCHAR,      max_length=100),
+    FieldSchema("lc_key",     DataType.VARCHAR,      max_length=200),
+    FieldSchema("lc_lang",    DataType.VARCHAR,      max_length=10),
+    FieldSchema("lc_lineno",  DataType.INT64),
+    FieldSchema("lc_tokens",  DataType.INT64),
+    FieldSchema("lc_vector",  DataType.FLOAT_VECTOR, dim=1536),
+]
+coll = create_collection(
+    "common_text", fields, "通用文本搜索",
+    metric=Metric.COSINE, index=Index.HNSW, base_dir="./db",
+)
+
+ids = coll.insert([
+    {"lc_section": "common", "lc_key": "btn_ok",
+     "lc_lang": "en", "lc_lineno": 12, "lc_tokens": 3,
+     "lc_vector": np.random.rand(1536).astype("float32")},
+])
+
+hits = coll.search(query, limit=10, output_fields=["lc_key", "lc_lang"])[0]
+for h in hits:
+    print(h.id, h.distance, h["lc_key"], h["lc_lang"])
+
+coll.flush()                       # 同时持久化 .pst 与边车文件
+coll.close()
+```
+
+完整可运行的 Milvus `create_database()` 移植示例位于
+[`examples/example_schema.py`](examples/example_schema.py)。
+
+同一套 API 在每个语言绑定中都可用：
+
+```go
+// Go —— wrap/go/pistadb/schema.go
+fields := []pistadb.FieldSchema{
+    {Name: "lc_id", DType: pistadb.DTypeInt64, IsPrimary: true, AutoID: true},
+    {Name: "lc_vector", DType: pistadb.DTypeFloatVector, Dim: 1536},
+}
+coll, _ := pistadb.CreateCollection("common_text", fields, "...",
+    pistadb.CollectionOptions{Metric: pistadb.MetricCosine, Index: pistadb.IndexHNSW})
+ids, _ := coll.Insert([]map[string]any{{"lc_vector": vec}})
+hits, _ := coll.Search(query, 10, nil)
+```
+
+```rust
+// Rust —— cargo build --features schema
+use pistadb::schema::{create_collection, CollectionOptions, DataType, FieldSchema};
+use pistadb::{IndexType, Metric};
+
+let fields = vec![
+    FieldSchema { name: "lc_id".into(),     dtype: DataType::Int64,
+                  is_primary: true, auto_id: true,    ..Default::default() },
+    FieldSchema { name: "lc_section".into(),dtype: DataType::VarChar,
+                  max_length: Some(100),             ..Default::default() },
+    FieldSchema { name: "lc_vector".into(), dtype: DataType::FloatVector,
+                  dim: Some(1536),                    ..Default::default() },
+];
+let coll = create_collection("common_text", fields, "通用文本搜索",
+    CollectionOptions { metric: Metric::Cosine, index: IndexType::HNSW,
+                        base_dir: Some("./db".into()), ..Default::default() })?;
+```
+
+```csharp
+// C# —— wrap/csharp/Collection.cs
+var fields = new[] {
+    new FieldSchema("lc_id",     DataType.Int64,       isPrimary: true, autoId: true),
+    new FieldSchema("lc_section",DataType.VarChar,     maxLength: 100),
+    new FieldSchema("lc_vector", DataType.FloatVector, dim: 1536),
+};
+var coll = Collection.Create("common_text", fields, "通用文本搜索",
+    metric: Metric.Cosine, indexType: IndexType.HNSW, baseDir: "./db");
+var ids = coll.Insert(new[] {
+    new Dictionary<string, object?> {
+        ["lc_section"] = "common",
+        ["lc_vector"]  = vec,
+    },
+});
+```
+
+```cpp
+// C++ —— #include "pistadb_schema.hpp"
+using namespace pistadb;
+std::vector<FieldSchema> fields = {
+    { "lc_id",     DataType::Int64,       /*primary=*/true, /*auto_id=*/true   },
+    { "lc_section",DataType::VarChar,     false, false, /*max_length=*/100      },
+    { "lc_vector", DataType::FloatVector, false, false, std::nullopt, /*dim=*/1536 },
+};
+auto coll = create_collection("common_text", std::move(fields), "通用文本搜索",
+    { Metric::Cosine, IndexType::HNSW, std::nullopt, std::string("./db") });
+coll.insert({{ {"lc_section", Value::str("common")},
+               {"lc_vector",  Value::floats(vec)} }});
+```
+
+```java
+// Java —— wrap/android/.../Collection.java
+List<FieldSchema> fields = Arrays.asList(
+    new FieldSchema.Builder("lc_id",     DataType.INT64).primary(true).autoId(true).build(),
+    new FieldSchema.Builder("lc_vector", DataType.FLOAT_VECTOR).dim(1536).build());
+Collection coll = Collection.create("common_text", fields, "...",
+    new Collection.Options().metric(Metric.COSINE).index(IndexType.HNSW));
+```
+
+```kotlin
+// Kotlin DSL —— wrap/android/.../CollectionExtensions.kt
+val coll = collection("common_text", fields = listOf(
+    field("lc_id",     DataType.INT64) { primary(true).autoId(true) },
+    field("lc_vector", DataType.FLOAT_VECTOR) { dim(1536) },
+)) { metric = Metric.COSINE; index = IndexType.HNSW }
+```
+
+```swift
+// Swift —— wrap/ios/Sources/PistaDB/PistaDBSchema.swift
+let fields: [FieldSchema] = [
+    try FieldSchema(name: "lc_id",     dtype: .int64,       isPrimary: true, autoId: true),
+    try FieldSchema(name: "lc_section",dtype: .varchar,     maxLength: 100),
+    try FieldSchema(name: "lc_vector", dtype: .floatVector, dim: 1536),
+]
+let coll = try createCollection(
+    name: "common_text", fields: fields, description: "通用文本搜索",
+    options: .init(metric: .cosine, indexType: .hnsw, baseDir: "./db"))
+```
+
+```javascript
+// WASM —— 从 pistadb_schema.js 导入后调用 attachSchema(M)
+const fields = [
+    new M.FieldSchema("lc_id",     M.DataType.INT64,        { isPrimary: true, autoId: true }),
+    new M.FieldSchema("lc_section",M.DataType.VARCHAR,      { maxLength: 100 }),
+    new M.FieldSchema("lc_vector", M.DataType.FLOAT_VECTOR, { dim: 1536 }),
+];
+const coll = M.createCollection("common_text", fields, "通用文本搜索", {
+    metric: M.Metric.Cosine, indexType: M.IndexType.HNSW,
+});
+coll.insert([{ lc_section: "common", lc_vector: new Float32Array(1536) }]);
+```
+
+> **Schema 校验规则**：必须有且仅有一个 `is_primary` 字段（类型为 `INT64`），
+> 必须有且仅有一个 `FLOAT_VECTOR` 字段（且 `dim` > 0），所有字段名唯一。
+> 这些约束在所有语言的构造阶段统一校验。
+
+---
+
 ## 运行测试
 
 ```bash
