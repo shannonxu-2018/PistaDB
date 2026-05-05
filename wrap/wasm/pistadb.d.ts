@@ -243,3 +243,133 @@ export interface PistaDBModule {
  */
 declare function PistaDB(options?: object): Promise<PistaDBModule>;
 export default PistaDB;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Milvus-style schema API (provided by `pistadb_schema.js`).
+// Call `attachSchema(M)` once after the WASM module loads, or call the
+// `createCollection` / `loadCollection` factories with the module as the
+// first argument.
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Per-field data type.  Mirrors `pymilvus.DataType`. */
+export declare const DataType: {
+    readonly BOOL:         1;
+    readonly INT8:         2;
+    readonly INT16:        3;
+    readonly INT32:        4;
+    readonly INT64:        5;
+    readonly FLOAT:        10;
+    readonly DOUBLE:       11;
+    readonly VARCHAR:      21;
+    readonly JSON:         23;
+    readonly FLOAT_VECTOR: 101;
+};
+export type DataTypeValue = (typeof DataType)[keyof typeof DataType];
+
+export interface FieldOptions {
+    isPrimary?:   boolean;
+    autoId?:      boolean;
+    /** VARCHAR only. */
+    maxLength?:   number;
+    /** FLOAT_VECTOR only — required and must be > 0. */
+    dim?:         number;
+    description?: string;
+}
+
+export declare class FieldSchema {
+    constructor(name: string, dtype: DataTypeValue, opts?: FieldOptions);
+    readonly name:        string;
+    readonly dtype:       DataTypeValue;
+    readonly isPrimary:   boolean;
+    readonly autoId:      boolean;
+    readonly maxLength:   number | null;
+    readonly dim:         number | null;
+    readonly description: string;
+}
+
+export declare class CollectionSchema {
+    constructor(fields: FieldSchema[], description?: string);
+    readonly fields:      FieldSchema[];
+    readonly description: string;
+    readonly primary:     FieldSchema;
+    readonly vector:      FieldSchema;
+    readonly scalarFields: FieldSchema[];
+    field(name: string): FieldSchema;
+}
+
+/** A single search hit with the projected scalar fields. */
+export declare class Hit {
+    readonly id:       number;
+    readonly distance: number;
+    readonly fields:   Record<string, unknown>;
+    get(name: string): unknown;
+}
+
+/** Per-row value type accepted by `Collection.insert()`. */
+export type Row = Record<string, unknown>;
+
+export interface CollectionOptions {
+    metric?:    Metric;
+    indexType?: IndexType;
+    params?:    PistaDBParams | null;
+    /** Directory in which `<name>.pst` is created.  Ignored if `path` is set. */
+    baseDir?:   string;
+    /** Explicit `.pst` path (overrides baseDir). */
+    path?:      string;
+    /** Replace existing files instead of failing. */
+    overwrite?: boolean;
+}
+
+export declare class Collection {
+    readonly name:        string;
+    readonly path:        string;
+    readonly schema:      CollectionSchema;
+    readonly numEntities: number;
+    readonly database:    Database;
+
+    insert(rows: Row[]): number[];
+    delete(idOrIds: number | number[]): number;
+    get(id: number): Row;
+    search(
+        query: Float32Array | number[],
+        k: number,
+        outputFields?: string[],
+    ): Hit[];
+
+    flush(): void;
+    save():  void;
+    close(): void;
+}
+
+/** Create a new collection.  See `pistadb_schema.js` for full docs. */
+export declare function createCollection(
+    M:           PistaDBModule,
+    name:        string,
+    fields:      FieldSchema[],
+    description?: string,
+    opts?:       CollectionOptions,
+): Collection;
+
+/** Re-open a previously created collection. */
+export declare function loadCollection(
+    M:    PistaDBModule,
+    name: string,
+    opts?: CollectionOptions,
+): Collection;
+
+/**
+ * Attach the schema API onto the module so callers can write
+ * `M.createCollection(...)` instead of `createCollection(M, ...)`.
+ */
+export declare function attachSchema(M: PistaDBModule): PistaDBModule & {
+    DataType:         typeof DataType;
+    FieldSchema:      typeof FieldSchema;
+    CollectionSchema: typeof CollectionSchema;
+    Hit:              typeof Hit;
+    Collection:       typeof Collection;
+    createCollection: (
+        name: string, fields: FieldSchema[], description?: string,
+        opts?: CollectionOptions,
+    ) => Collection;
+    loadCollection: (name: string, opts?: CollectionOptions) => Collection;
+};

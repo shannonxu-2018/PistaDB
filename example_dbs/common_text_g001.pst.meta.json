@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "name": "common_text_g001",
+  "schema": {
+    "fields": [
+      {
+        "name": "lc_id",
+        "dtype": "INT64",
+        "is_primary": true,
+        "auto_id": true,
+        "max_length": null,
+        "dim": null,
+        "description": ""
+      },
+      {
+        "name": "lc_section",
+        "dtype": "VARCHAR",
+        "is_primary": false,
+        "auto_id": false,
+        "max_length": 100,
+        "dim": null,
+        "description": "Localization section name."
+      },
+      {
+        "name": "lc_key",
+        "dtype": "VARCHAR",
+        "is_primary": false,
+        "auto_id": false,
+        "max_length": 200,
+        "dim": null,
+        "description": "Localization key."
+      },
+      {
+        "name": "lc_lang",
+        "dtype": "VARCHAR",
+        "is_primary": false,
+        "auto_id": false,
+        "max_length": 10,
+        "dim": null,
+        "description": "Two-letter language code."
+      },
+      {
+        "name": "lc_lineno",
+        "dtype": "INT64",
+        "is_primary": false,
+        "auto_id": false,
+        "max_length": null,
+        "dim": null,
+        "description": "Line number in source file."
+      },
+      {
+        "name": "lc_tokens",
+        "dtype": "INT64",
+        "is_primary": false,
+        "auto_id": false,
+        "max_length": null,
+        "dim": null,
+        "description": "Token count of the raw string."
+      },
+      {
+        "name": "lc_vector",
+        "dtype": "FLOAT_VECTOR",
+        "is_primary": false,
+        "auto_id": false,
+        "max_length": null,
+        "dim": 1536,
+        "description": "Embedding vector of the raw string."
+      }
+    ],
+    "description": "Common text search"
+  },
+  "metric": "COSINE",
+  "index": "HNSW",
+  "next_id": 4,
+  "rows": {
+    "1": {
+      "lc_section": "common",
+      "lc_key": "btn_ok",
+      "lc_lang": "en",
+      "lc_lineno": 12,
+      "lc_tokens": 3
+    },
+    "2": {
+      "lc_section": "common",
+      "lc_key": "btn_cancel",
+      "lc_lang": "en",
+      "lc_lineno": 13,
+      "lc_tokens": 4
+    },
+    "3": {
+      "lc_section": "settings",
+      "lc_key": "title",
+      "lc_lang": "en",
+      "lc_lineno": 42,
+      "lc_tokens": 2
+    }
+  }
+}

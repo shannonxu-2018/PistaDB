@@ -52,6 +52,9 @@
 mod ffi;
 mod types;
 
+#[cfg(feature = "schema")]
+pub mod schema;
+
 pub use types::{Error, IndexType, Metric, Params, Result, SearchResult, VectorEntry};
 
 use std::ffi::CString;

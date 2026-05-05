@@ -6,7 +6,15 @@ description = "Rust binding for PistaDB — lightweight embedded vector database
 license     = "MIT"
 readme      = "../README.md"
 
-# No external runtime dependencies — pure std + FFI
+# Default build has no external runtime dependencies — pure std + FFI.
+# The optional `schema` feature enables a Milvus-style multi-field collection
+# layer that uses serde + serde_json to persist a JSON sidecar.
 [dependencies]
+serde      = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [build-dependencies]
+
+[features]
+default = []
+schema  = ["dep:serde", "dep:serde_json"]

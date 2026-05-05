@@ -1133,4 +1133,27 @@ __all__ = [
     "CacheStats",
     "Transaction",
     "TXN_PARTIAL",
+    # Milvus-style schema API (defined in schema.py — imported lazily below
+    # to avoid a circular import while this module is still being executed).
+    "DataType",
+    "FieldSchema",
+    "CollectionSchema",
+    "Collection",
+    "Hit",
+    "create_collection",
+    "load_collection",
 ]
+
+
+# ── Milvus-style schema layer ─────────────────────────────────────────────────
+# Imported after the names above are defined so schema.py's
+# ``from . import PistaDB, Metric, Index, Params, SearchResult`` resolves.
+from .schema import (  # noqa: E402
+    DataType,
+    FieldSchema,
+    CollectionSchema,
+    Collection,
+    Hit,
+    create_collection,
+    load_collection,
+)

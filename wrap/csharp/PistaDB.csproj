@@ -11,4 +11,10 @@
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <Optimize>true</Optimize>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- Used by the Milvus-style schema/Collection layer to read/write the
+         JSON sidecar that holds non-vector scalar fields. Built-in for
+         net6.0+; on netstandard2.0 we pull it in via NuGet. -->
+    <PackageReference Include="System.Text.Json" Version="6.0.9" />
+  </ItemGroup>
 </Project>
