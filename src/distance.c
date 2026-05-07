@@ -20,10 +20,21 @@
 #include "distance_simd.h"
 #include <math.h>
 #include <float.h>
+#include <stdio.h>
 
 /* MSVC: __cpuid, _xgetbv live in <intrin.h> */
 #if defined(_MSC_VER)
 #  include <intrin.h>
+#endif
+
+/* Portable read prefetch.  No-op fallback never affects correctness. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define PISTA_PREFETCH(p) __builtin_prefetch((const void *)(p), 0, 1)
+#elif defined(_MSC_VER)
+#  include <xmmintrin.h>
+#  define PISTA_PREFETCH(p) _mm_prefetch((const char *)(p), _MM_HINT_T1)
+#else
+#  define PISTA_PREFETCH(p) ((void)0)
 #endif
 
 /* ── Scalar implementations ──────────────────────────────────────────────── */
@@ -101,6 +112,67 @@ static DistFn     active_dist_ip    = scalar_dist_ip;
 static DistFn     active_dist_l1    = scalar_dist_l1;
 static DistFn     active_dist_hamming = scalar_dist_hamming;
 
+/* ── Self-test: verify the chosen SIMD kernels agree with scalar ──────────
+ *
+ * Called once at SIMD init time.  Computes 8 deterministic vector pairs
+ * each way and falls back to the scalar dispatch if any difference exceeds
+ * a small tolerance — guards against a silently-broken SIMD kernel poisoning
+ * every search.  Tolerance accounts for accumulator-order rounding (lanes
+ * are summed in a different order than the scalar reference).
+ */
+
+#define SIMD_SELFTEST_DIM   32
+#define SIMD_SELFTEST_PAIRS 8
+#define SIMD_SELFTEST_TOL   1e-3f   /* relative + absolute slack */
+
+static int floats_close(float a, float b, float tol) {
+    float d = a - b;
+    if (d < 0) d = -d;
+    float scale = (a < 0 ? -a : a);
+    if ((b < 0 ? -b : b) > scale) scale = (b < 0 ? -b : b);
+    return d <= tol * (1.0f + scale);
+}
+
+static int simd_self_check(void) {
+    float a[SIMD_SELFTEST_DIM], b[SIMD_SELFTEST_DIM];
+    /* Deterministic pseudo-random fill via a tiny LCG. */
+    uint32_t s = 0xC0FFEEu;
+    for (int p = 0; p < SIMD_SELFTEST_PAIRS; p++) {
+        for (int i = 0; i < SIMD_SELFTEST_DIM; i++) {
+            s = s * 1664525u + 1013904223u;
+            a[i] = (float)((int32_t)s) * (1.0f / 2147483648.0f);
+            s = s * 1664525u + 1013904223u;
+            b[i] = (float)((int32_t)s) * (1.0f / 2147483648.0f);
+        }
+        if (!floats_close(active_dist_l2sq(a, b, SIMD_SELFTEST_DIM),
+                          scalar_dist_l2sq(a, b, SIMD_SELFTEST_DIM),
+                          SIMD_SELFTEST_TOL)) return 0;
+        if (!floats_close(active_vec_dot(a, b, SIMD_SELFTEST_DIM),
+                          scalar_vec_dot(a, b, SIMD_SELFTEST_DIM),
+                          SIMD_SELFTEST_TOL)) return 0;
+        if (!floats_close(active_dist_cosine(a, b, SIMD_SELFTEST_DIM),
+                          scalar_dist_cosine(a, b, SIMD_SELFTEST_DIM),
+                          SIMD_SELFTEST_TOL)) return 0;
+        if (!floats_close(active_dist_l1(a, b, SIMD_SELFTEST_DIM),
+                          scalar_dist_l1(a, b, SIMD_SELFTEST_DIM),
+                          SIMD_SELFTEST_TOL)) return 0;
+        if (active_dist_hamming(a, b, SIMD_SELFTEST_DIM) !=
+            scalar_dist_hamming(a, b, SIMD_SELFTEST_DIM)) return 0;
+    }
+    return 1;
+}
+
+static void simd_force_scalar(void) {
+    active_vec_dot       = scalar_vec_dot;
+    active_vec_norm      = scalar_vec_norm;
+    active_dist_l2sq     = scalar_dist_l2sq;
+    active_dist_l2       = scalar_dist_l2;
+    active_dist_cosine   = scalar_dist_cosine;
+    active_dist_ip       = scalar_dist_ip;
+    active_dist_l1       = scalar_dist_l1;
+    active_dist_hamming  = scalar_dist_hamming;
+}
+
 /* ── SIMD detection body (called exactly once, any platform) ─────────────── */
 /*
  * PISTADB_HAS_AVX2 and PISTADB_HAS_NEON are defined by CMake only when the
@@ -160,6 +232,15 @@ static void simd_detect(void)
     active_dist_hamming = dist_hamming_neon;
 #endif /* PISTADB_HAS_NEON */
     /* scalar fallback: already set as the default, nothing to do */
+
+    /* One-shot self-test: if the chosen SIMD kernel disagrees with scalar
+     * on a deterministic small-dim sample, revert all pointers to scalar.
+     * Also stderr-warn so build / deployment problems are surfaced. */
+    if (!simd_self_check()) {
+        simd_force_scalar();
+        fprintf(stderr,
+            "PistaDB: SIMD self-test failed — reverting to scalar kernels\n");
+    }
 }
 
 /* ── Thread-safe one-time wrapper ────────────────────────────────────────── */
@@ -224,6 +305,59 @@ float dist_hamming(const float *a, const float *b, int dim) {
 }
 
 /* ── dispatch ────────────────────────────────────────────────────────────── */
+
+/* ── Batched (one query → many candidates) kernels ────────────────────────
+ *
+ * Each batch entry hoists `simd_init` + the active fn-pointer load out of
+ * the hot loop, and prefetches the next candidate's vector while the
+ * current one is being scored.  The body is a thin per-pair loop, so
+ * results are bit-identical to calling the per-pair public API once per
+ * candidate — no new arithmetic to verify.
+ */
+
+#define BATCH_BODY(FN_PTR)                                                  \
+    do {                                                                    \
+        simd_init();                                                        \
+        DistFn fn = (FN_PTR);                                               \
+        for (size_t i = 0; i < n; i++) {                                    \
+            if (i + 1 < n) PISTA_PREFETCH(vecs[i + 1]);                     \
+            out[i] = fn(query, vecs[i], dim);                               \
+        }                                                                   \
+    } while (0)
+
+void dist_many_to_one_l2sq(const float *query, const float *const *vecs,
+                            size_t n, int dim, float *out)
+{ BATCH_BODY(active_dist_l2sq); }
+
+void dist_many_to_one_cosine(const float *query, const float *const *vecs,
+                              size_t n, int dim, float *out)
+{ BATCH_BODY(active_dist_cosine); }
+
+void dist_many_to_one_ip(const float *query, const float *const *vecs,
+                          size_t n, int dim, float *out)
+{ BATCH_BODY(active_dist_ip); }
+
+void dist_many_to_one_l1(const float *query, const float *const *vecs,
+                          size_t n, int dim, float *out)
+{ BATCH_BODY(active_dist_l1); }
+
+void dist_many_to_one_hamming(const float *query, const float *const *vecs,
+                               size_t n, int dim, float *out)
+{ BATCH_BODY(active_dist_hamming); }
+
+#undef BATCH_BODY
+
+BatchDistFn pistadb_get_batch_rank_dist_fn(PistaDBMetric metric) {
+    simd_init();
+    switch (metric) {
+        case METRIC_L2:      return dist_many_to_one_l2sq;
+        case METRIC_COSINE:  return dist_many_to_one_cosine;
+        case METRIC_IP:      return dist_many_to_one_ip;
+        case METRIC_L1:      return dist_many_to_one_l1;
+        case METRIC_HAMMING: return dist_many_to_one_hamming;
+        default:             return dist_many_to_one_l2sq;
+    }
+}
 
 DistFn pistadb_get_dist_fn(PistaDBMetric metric) {
     simd_init();

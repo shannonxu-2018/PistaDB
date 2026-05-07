@@ -47,6 +47,41 @@ typedef float (*DistFn)(const float *, const float *, int);
 /** Return the distance function for the given metric type. */
 DistFn pistadb_get_dist_fn(PistaDBMetric metric);
 
+/* ── Batched (one query → many candidates) kernels ──────────────────────── */
+
+/**
+ * Compute the distance from a single query to N candidate vectors in one
+ * call.  Candidates are passed as an array of N float pointers (each of
+ * length `dim`); results are written to `out[0..n-1]` in order.
+ *
+ * Today these are thin wrappers that hoist the SIMD dispatch out of the
+ * inner loop and issue a prefetch for the next candidate vector.  The
+ * results are bit-identical to calling the per-pair functions one at a
+ * time; the win is amortised dispatch + cache-line prefetch + slightly
+ * better register scheduling because the kernel body is monomorphic.
+ *
+ * Used by Linear / IVF probe / LSH rerank / HNSW fan-out hot loops.
+ */
+void dist_many_to_one_l2sq    (const float *query, const float *const *vecs,
+                                size_t n, int dim, float *out);
+void dist_many_to_one_cosine  (const float *query, const float *const *vecs,
+                                size_t n, int dim, float *out);
+void dist_many_to_one_ip      (const float *query, const float *const *vecs,
+                                size_t n, int dim, float *out);
+void dist_many_to_one_l1      (const float *query, const float *const *vecs,
+                                size_t n, int dim, float *out);
+void dist_many_to_one_hamming (const float *query, const float *const *vecs,
+                                size_t n, int dim, float *out);
+
+/** Function-pointer type for the batch kernels above. */
+typedef void (*BatchDistFn)(const float *query, const float *const *vecs,
+                            size_t n, int dim, float *out);
+
+/** Return the batch kernel matching the metric.  For METRIC_L2 this
+ *  returns the L2² variant — callers ranking by L2 should sqrtf the
+ *  finished top-K (matching pistadb_get_rank_dist_fn). */
+BatchDistFn pistadb_get_batch_rank_dist_fn(PistaDBMetric metric);
+
 /**
  * Return a *ranking*-equivalent distance function for the given metric.
  *
