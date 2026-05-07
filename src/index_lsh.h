@@ -55,8 +55,9 @@ typedef struct {
     int       n_vecs;
     int       vec_cap;
 
-    int       dim;
-    DistFn    dist_fn;
+    int           dim;
+    DistFn        dist_fn;
+    BatchDistFn   batch_fn;       /* may be NULL → fallback to dist_fn loop */
     PistaDBMetric metric;
 } LSHIndex;
 

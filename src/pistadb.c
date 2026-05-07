@@ -117,6 +117,7 @@ static int create_index(PistaDB *db) {
         case INDEX_LSH:
             r = lsh_create(&db->idx.lsh, db->dim, fn, db->metric,
                            p->lsh_L, p->lsh_K, p->lsh_w);
+            if (r == PISTADB_OK) db->idx.lsh.batch_fn = bfn;
             break;
         case INDEX_SCANN:
             r = scann_create(&db->idx.scann, db->dim, fn, db->metric,
@@ -252,6 +253,7 @@ static int load_from_file(PistaDB *db) {
             break;
         case INDEX_LSH:
             r = lsh_load(&db->idx.lsh, vec_buf, vec_sz, db->dim, fn, db->metric);
+            if (r == PISTADB_OK) db->idx.lsh.batch_fn = bfn;
             break;
         case INDEX_SCANN:
             r = scann_load(&db->idx.scann, vec_buf, vec_sz, db->dim, fn, db->metric);

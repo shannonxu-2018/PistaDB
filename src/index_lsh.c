@@ -110,6 +110,7 @@ int lsh_create(LSHIndex *idx, int dim, DistFn dist_fn, PistaDBMetric metric,
     memset(idx, 0, sizeof(*idx));
     idx->dim      = dim;
     idx->dist_fn  = dist_fn;
+    idx->batch_fn = NULL;          /* set by pistadb.c after create / load */
     idx->metric   = metric;
     idx->L        = L;
     idx->K        = K;
@@ -226,14 +227,43 @@ int lsh_search(const LSHIndex *idx, const float *query, int k,
     }
     free(visited);
 
-    /* Exact re-ranking — O(1) per candidate (direct slot access, no id lookup). */
+    /* Exact re-ranking via batched distance — O(1) per candidate, but with
+     * dispatch hoisted out of the inner loop and the next vector
+     * prefetched.  Falls back to per-pair when batch_fn is unset. */
     Heap heap; heap_init(&heap, k + 4, 1);
-    for (int ci = 0; ci < n_cands; ci++) {
-        int s = cand_slots[ci];
-        if (idx->vec_deleted[s]) continue;
-        float d = idx->dist_fn(query, VS_VEC(&idx->vs, s), idx->dim);
-        if (heap.size < k) heap_push(&heap, d, (uint64_t)s);
-        else if (d < heap_top(&heap).key) { heap_pop(&heap); heap_push(&heap, d, (uint64_t)s); }
+    {
+        enum { BATCH = 256 };
+        const float *ptrs [BATCH];
+        int          slots[BATCH];
+        float        dbuf [BATCH];
+        int ci = 0;
+        while (ci < n_cands) {
+            int n = 0;
+            while (ci < n_cands && n < BATCH) {
+                int s = cand_slots[ci++];
+                if (idx->vec_deleted[s]) continue;
+                ptrs [n] = VS_VEC(&idx->vs, s);
+                slots[n] = s;
+                n++;
+            }
+            if (n == 0) continue;
+            if (idx->batch_fn) {
+                idx->batch_fn(query, ptrs, (size_t)n, idx->dim, dbuf);
+            } else {
+                for (int t = 0; t < n; t++)
+                    dbuf[t] = idx->dist_fn(query, ptrs[t], idx->dim);
+            }
+            for (int t = 0; t < n; t++) {
+                float d = dbuf[t];
+                int   s = slots[t];
+                if (heap.size < k) {
+                    heap_push(&heap, d, (uint64_t)s);
+                } else if (d < heap_top(&heap).key) {
+                    heap_pop(&heap);
+                    heap_push(&heap, d, (uint64_t)s);
+                }
+            }
+        }
     }
     free(cand_slots);
 
