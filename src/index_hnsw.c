@@ -151,15 +151,15 @@ static inline float query_dist(const HNSWIndex *idx, const float *q, int node) {
  */
 static int search_layer(const HNSWIndex *idx, const float *query,
                          int ep, int ef, int layer,
-                         Heap *W, Heap *C, Bitset *visited) {
+                         Heap *W, Heap *C, EpochSet *visited) {
     heap_clear(W);
     heap_clear(C);
-    bitset_clear(visited);
+    epochset_clear(visited);
 
     float d_ep = query_dist(idx, query, ep);
     heap_push(C, d_ep, (uint64_t)ep);   /* min-heap: nearest on top */
     heap_push(W, d_ep, (uint64_t)ep);   /* max-heap: furthest on top */
-    bitset_set(visited, ep);
+    epochset_set(visited, ep);
 
     while (C->size > 0) {
         HeapItem c = heap_pop(C);       /* nearest candidate */
@@ -174,8 +174,8 @@ static int search_layer(const HNSWIndex *idx, const float *query,
         for (int j = 0; j < cn->neighbor_cnt[layer]; j++) {
             int nb = cn->neighbors[layer][j];
             if (nb < 0 || nb >= idx->n_nodes) continue;
-            if (bitset_test(visited, nb)) continue;
-            bitset_set(visited, nb);
+            if (epochset_test(visited, nb)) continue;
+            epochset_set(visited, nb);
             /* Tombstoned node — same vec_id == UINT64_MAX sentinel as
              * hnsw_delete().  Skip the distance call and do not enqueue
              * into C/W: it would only be filtered at result-extraction
@@ -254,10 +254,10 @@ int hnsw_insert(HNSWIndex *idx, uint64_t id, const char *label, const float *vec
     int max_ef = (idx->ef_construction > idx->M_max0 * 4) ?
                   idx->ef_construction : idx->M_max0 * 4;
     Heap   W, C;
-    Bitset visited;
+    EpochSet visited;
     heap_init(&W, max_ef + 8, 1);  /* max-heap */
     heap_init(&C, max_ef + 8, 0);  /* min-heap */
-    bitset_init(&visited, idx->node_cap + 8);
+    epochset_init(&visited, idx->node_cap + 8);
 
     int ep = idx->ep_node;
     int L  = idx->max_layer;
@@ -320,7 +320,7 @@ int hnsw_insert(HNSWIndex *idx, uint64_t id, const char *label, const float *vec
 
     heap_free(&W);
     heap_free(&C);
-    bitset_free(&visited);
+    epochset_free(&visited);
     return PISTADB_OK;
 }
 
@@ -355,10 +355,10 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
 
     int max_ef = ef + 8;
     Heap   W, C;
-    Bitset visited;
+    EpochSet visited;
     heap_init(&W, max_ef + 8, 1);
     heap_init(&C, max_ef + 8, 0);
-    bitset_init(&visited, idx->n_nodes + 8);
+    epochset_init(&visited, idx->n_nodes + 8);
 
     int ep = idx->ep_node;
     int L  = idx->max_layer;
@@ -366,7 +366,7 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
     for (int lc = L; lc > 0; lc--) {
         search_layer(idx, query, ep, 1, lc, &W, &C, &visited);
         if (W.size > 0) ep = (int)heap_top(&W).id;
-        heap_clear(&W); heap_clear(&C); bitset_clear(&visited);
+        heap_clear(&W); heap_clear(&C); epochset_clear(&visited);
     }
     search_layer(idx, query, ep, ef, 0, &W, &C, &visited);
 
@@ -380,7 +380,7 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
         node_buf = (int   *)malloc(sizeof(int)   * (size_t)total);
         if (!dist_buf || !node_buf) {
             free(dist_buf); free(node_buf);
-            heap_free(&W); heap_free(&C); bitset_free(&visited);
+            heap_free(&W); heap_free(&C); epochset_free(&visited);
             return 0;
         }
         while (W.size > 0) {
@@ -401,7 +401,7 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
     }
     free(dist_buf); free(node_buf);
     heap_free(&W); heap_free(&C);
-    bitset_free(&visited);
+    epochset_free(&visited);
     return cnt;
 }
 

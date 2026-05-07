@@ -182,6 +182,41 @@ int  bitset_test(const Bitset *bs, int idx) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * EpochSet — generation-counter visited set (used by HNSW)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+int epochset_init(EpochSet *es, int cap) {
+    if (cap < 0) cap = 0;
+    es->gen   = (uint32_t *)calloc((size_t)cap, sizeof(uint32_t));
+    if (!es->gen && cap > 0) return PISTADB_ENOMEM;
+    es->cap   = cap;
+    es->epoch = 1;     /* gen[]=0 from calloc → never matches epoch=1 */
+    return PISTADB_OK;
+}
+
+void epochset_free(EpochSet *es) { free(es->gen); es->gen = NULL; es->cap = 0; }
+
+void epochset_clear(EpochSet *es) {
+    /* Common path: just bump the epoch — O(1). */
+    if (++es->epoch != 0) return;
+    /* Overflow (~every 4 billion clears): one-shot reset. */
+    if (es->cap > 0 && es->gen) {
+        memset(es->gen, 0, sizeof(uint32_t) * (size_t)es->cap);
+    }
+    es->epoch = 1;
+}
+
+void epochset_set(EpochSet *es, int idx) {
+    if (idx < 0 || idx >= es->cap) return;
+    es->gen[idx] = es->epoch;
+}
+
+int epochset_test(const EpochSet *es, int idx) {
+    if (idx < 0 || idx >= es->cap) return 0;
+    return es->gen[idx] == es->epoch;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * CRC32 (IEEE 802.3 polynomial, 256-entry lookup table)
  * ══════════════════════════════════════════════════════════════════════════ */
 

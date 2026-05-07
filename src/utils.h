@@ -78,7 +78,7 @@ float pcg_f32(PCG *rng);
 float pcg_normal(PCG *rng);
 
 /* ══════════════════════════════════════════════════════════════════════════
- * Visited bitset  (for HNSW search)
+ * Visited bitset  (used by DiskANN / LSH search dedup)
  * ══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
@@ -92,6 +92,28 @@ void bitset_free(Bitset *bs);
 void bitset_clear(Bitset *bs);
 void bitset_set(Bitset *bs, int idx);
 int  bitset_test(const Bitset *bs, int idx);
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Visited epoch-set  (HNSW search; replaces per-call memset of a bitset)
+ *
+ * Each slot stores the epoch it was last marked at.  `clear` simply bumps
+ * the global epoch; only on uint32 overflow (every ~4 billion calls) do
+ * we pay a one-shot memset.  Memory cost: 4 bytes / slot vs 1/8 byte for
+ * Bitset, traded for no per-call memset on hot search paths.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    uint32_t *gen;
+    uint32_t  epoch;
+    int       cap;
+} EpochSet;
+
+int  epochset_init(EpochSet *es, int cap);
+void epochset_free(EpochSet *es);
+/** Begin a new "generation" — O(1) on the common path. */
+void epochset_clear(EpochSet *es);
+void epochset_set(EpochSet *es, int idx);
+int  epochset_test(const EpochSet *es, int idx);
 
 /* ══════════════════════════════════════════════════════════════════════════
  * CRC32  (for file header integrity)
