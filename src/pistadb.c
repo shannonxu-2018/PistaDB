@@ -99,6 +99,7 @@ static int create_index(PistaDB *db) {
         case INDEX_HNSW:
             r = hnsw_create(&db->idx.hnsw, db->dim, fn,
                             p->hnsw_M, p->hnsw_ef_construction, p->hnsw_ef_search);
+            if (r == PISTADB_OK) db->idx.hnsw.batch_fn = bfn;
             break;
         case INDEX_IVF:
             r = ivf_create(&db->idx.ivf, db->dim, fn,
@@ -232,6 +233,7 @@ static int load_from_file(PistaDB *db) {
             break;
         case INDEX_HNSW:
             r = hnsw_load(&db->idx.hnsw, vec_buf, vec_sz, db->dim, fn);
+            if (r == PISTADB_OK) db->idx.hnsw.batch_fn = bfn;
             break;
         case INDEX_IVF:
             r = ivf_load(&db->idx.ivf, vec_buf, vec_sz, db->dim, fn);

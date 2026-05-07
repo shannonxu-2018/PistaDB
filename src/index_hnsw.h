@@ -39,8 +39,9 @@ typedef struct {
     /* Floating vector data (owned by this index) */
     VecStore  vs;              /* chunked vector + label storage    */
 
-    int       dim;
-    DistFn    dist_fn;
+    int           dim;
+    DistFn        dist_fn;
+    BatchDistFn   batch_fn;        /* may be NULL → fallback to dist_fn loop */
 
     /* HNSW parameters */
     int       M;               /* max connections per layer (≥ 2)   */

@@ -111,6 +111,7 @@ int hnsw_create(HNSWIndex *idx, int dim, DistFn dist_fn,
     if (M > HNSW_MAX_M) M = HNSW_MAX_M;
     idx->dim            = dim;
     idx->dist_fn        = dist_fn;
+    idx->batch_fn       = NULL;       /* set by pistadb.c after create / load */
     idx->M              = M;
     idx->M_max0         = M * 2;
     idx->ef_construction= ef_construction;
@@ -184,11 +185,22 @@ static int search_layer(const HNSWIndex *idx, const float *query,
         if (layer > cn->level) continue;
 
         const int n_nb = cn->neighbor_cnt[layer];
-        for (int j = 0; j < n_nb; j++) {
+
+        /* Two-pass fan-out: first gather "live & unvisited" neighbors into
+         * a stack buffer, then issue ONE batched distance call for them.
+         * This hoists the SIMD dispatch out of the per-neighbor loop and
+         * lets the kernel prefetch each next vector while computing the
+         * current one.  The output ordering and heap maintenance are
+         * unchanged — bit-identical to the per-pair fallback. */
+        enum { FAN_BATCH = 64 };       /* M_max0 ≤ 64 by construction      */
+        const float *fan_ptrs [FAN_BATCH];
+        int          fan_nb   [FAN_BATCH];
+        float        fan_dist [FAN_BATCH];
+
+        int fan_n = 0;
+        for (int j = 0; j < n_nb && fan_n < FAN_BATCH; j++) {
             int nb = cn->neighbors[layer][j];
-            /* Prefetch the *next* neighbor's vector while we work on `nb` —
-             * the distance kernel is FMA-bound at high dim and benefits from
-             * having the cache line in flight one iteration ahead. */
+            /* Prefetch the next neighbor while we triage this one. */
             if (j + 1 < n_nb) {
                 int nb_next = cn->neighbors[layer][j + 1];
                 if (nb_next >= 0 && nb_next < idx->n_nodes) {
@@ -204,14 +216,27 @@ static int search_layer(const HNSWIndex *idx, const float *query,
              * time anyway.  Side-effect: we no longer traverse through
              * deleted nodes, which is fine at the M values we use here. */
             if (idx->nodes[nb].vec_id == UINT64_MAX) continue;
-
-            float d_nb = query_dist(idx, query, nb);
-            float w_far2 = heap_top(W).key;
-
-            if (d_nb < w_far2 || W->size < ef) {
-                heap_push(C, d_nb, (uint64_t)nb);
-                heap_push(W, d_nb, (uint64_t)nb);
-                if (W->size > ef) heap_pop(W);  /* remove furthest */
+            fan_ptrs[fan_n] = VS_VEC(&idx->vs, nb);
+            fan_nb  [fan_n] = nb;
+            fan_n++;
+        }
+        if (fan_n > 0) {
+            if (idx->batch_fn) {
+                idx->batch_fn(query, fan_ptrs, (size_t)fan_n,
+                              idx->dim, fan_dist);
+            } else {
+                for (int t = 0; t < fan_n; t++)
+                    fan_dist[t] = query_dist(idx, query, fan_nb[t]);
+            }
+            for (int t = 0; t < fan_n; t++) {
+                float d_nb   = fan_dist[t];
+                int   nb     = fan_nb[t];
+                float w_far2 = heap_top(W).key;
+                if (d_nb < w_far2 || W->size < ef) {
+                    heap_push(C, d_nb, (uint64_t)nb);
+                    heap_push(W, d_nb, (uint64_t)nb);
+                    if (W->size > ef) heap_pop(W);  /* remove furthest */
+                }
             }
         }
     }
