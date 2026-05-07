@@ -120,14 +120,29 @@ int lsh_create(LSHIndex *idx, int dim, DistFn dist_fn, PistaDBMetric metric,
     idx->tables    = (LSHTable *)calloc((size_t)L, sizeof(LSHTable));
     idx->vec_ids   = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)idx->vec_cap);
     idx->vec_deleted=(uint8_t  *)calloc((size_t)idx->vec_cap, 1);
-    if (!idx->tables || !idx->vec_ids || !idx->vec_deleted)
+    if (!idx->tables || !idx->vec_ids || !idx->vec_deleted) {
+        free(idx->tables); free(idx->vec_ids); free(idx->vec_deleted);
+        memset(idx, 0, sizeof(*idx));
         return PISTADB_ENOMEM;
-    if (vs_init(&idx->vs, dim, idx->vec_cap) != PISTADB_OK) return PISTADB_ENOMEM;
+    }
+    if (vs_init(&idx->vs, dim, idx->vec_cap) != PISTADB_OK) {
+        free(idx->tables); free(idx->vec_ids); free(idx->vec_deleted);
+        memset(idx, 0, sizeof(*idx));
+        return PISTADB_ENOMEM;
+    }
 
     PCG rng; pcg_seed(&rng, 42);
     for (int l = 0; l < L; l++) {
         int r = table_init(&idx->tables[l], K, dim, w, metric, &rng);
-        if (r != PISTADB_OK) return r;
+        if (r != PISTADB_OK) {
+            /* Roll back already-initialised tables and the vector store so
+             * lsh_free is not called on a half-built index. */
+            for (int j = 0; j < l; j++) table_free(&idx->tables[j]);
+            free(idx->tables); free(idx->vec_ids); free(idx->vec_deleted);
+            vs_free(&idx->vs);
+            memset(idx, 0, sizeof(*idx));
+            return r;
+        }
     }
     return PISTADB_OK;
 }
@@ -230,7 +245,11 @@ int lsh_search(const LSHIndex *idx, const float *query, int k,
     /* Exact re-ranking via batched distance — O(1) per candidate, but with
      * dispatch hoisted out of the inner loop and the next vector
      * prefetched.  Falls back to per-pair when batch_fn is unset. */
-    Heap heap; heap_init(&heap, k + 4, 1);
+    Heap heap;
+    if (heap_init(&heap, k + 4, 1) != PISTADB_OK) {
+        free(cand_slots);
+        return 0;
+    }
     {
         enum { BATCH = 256 };
         const float *ptrs [BATCH];
@@ -411,7 +430,16 @@ int lsh_load(LSHIndex *idx, const void *buf, size_t size,
                 t->buckets[b].slots = (int *)malloc(sizeof(int) * (size_t)sz);
                 if (!t->buckets[b].slots) return PISTADB_ENOMEM;
                 t->buckets[b].size = t->buckets[b].cap = sz;
-                for (int j = 0; j < sz; j++) { t->buckets[b].slots[j] = *(const int32_t*)p; p += 4; }
+                for (int j = 0; j < sz; j++) {
+                    int32_t slot;
+                    memcpy(&slot, p, sizeof slot);
+                    p += 4;
+                    /* Reject slot indices that point outside the loaded vector
+                     * store — silent corruption here would cause OOB reads in
+                     * lsh_search via vec_ids/vec_deleted. */
+                    if (slot < 0 || slot >= n_vecs) return PISTADB_ECORRUPT;
+                    t->buckets[b].slots[j] = slot;
+                }
             }
         }
     }

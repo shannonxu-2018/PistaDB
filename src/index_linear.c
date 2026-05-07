@@ -17,6 +17,7 @@
 
 int linear_create(LinearIndex *idx, int dim, DistFn dist_fn, int initial_cap) {
     if (initial_cap <= 0) initial_cap = INITIAL_CAP;
+    memset(idx, 0, sizeof(*idx));
     idx->dim      = dim;
     idx->dist_fn  = dist_fn;
     idx->batch_fn = NULL;       /* set by pistadb.c after create / load */
@@ -28,9 +29,16 @@ int linear_create(LinearIndex *idx, int dim, DistFn dist_fn, int initial_cap) {
 
     if (!idx->ids || !idx->deleted) {
         free(idx->ids); free(idx->deleted);
+        idx->ids = NULL; idx->deleted = NULL;
         return PISTADB_ENOMEM;
     }
-    if (vs_init(&idx->vs, dim, initial_cap) != PISTADB_OK) return PISTADB_ENOMEM;
+    if (vs_init(&idx->vs, dim, initial_cap) != PISTADB_OK) {
+        /* vs_init failed — release the previously-successful allocations so
+         * the caller (or free_active_index) does not see a half-built index. */
+        free(idx->ids); free(idx->deleted);
+        idx->ids = NULL; idx->deleted = NULL;
+        return PISTADB_ENOMEM;
+    }
     return PISTADB_OK;
 }
 

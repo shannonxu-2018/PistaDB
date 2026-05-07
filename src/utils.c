@@ -182,16 +182,20 @@ float pcg_normal(PCG *rng) {
  * ══════════════════════════════════════════════════════════════════════════ */
 
 int bitset_init(Bitset *bs, int n_bits) {
+    if (n_bits < 0) n_bits = 0;
     int nb = (n_bits + 7) / 8;
-    bs->bits   = (uint8_t *)calloc((size_t)nb, 1);
-    if (!bs->bits) return PISTADB_ENOMEM;
+    /* calloc(0, 1) is implementation-defined — it may return NULL even
+     * though no allocation failure occurred.  Treat an empty bitset as a
+     * valid object with no backing storage. */
+    bs->bits = (nb > 0) ? (uint8_t *)calloc((size_t)nb, 1) : NULL;
+    if (nb > 0 && !bs->bits) return PISTADB_ENOMEM;
     bs->n_bytes = nb;
     bs->n_bits  = n_bits;
     return PISTADB_OK;
 }
 
-void bitset_free(Bitset *bs)  { free(bs->bits); bs->bits = NULL; }
-void bitset_clear(Bitset *bs) { memset(bs->bits, 0, (size_t)bs->n_bytes); }
+void bitset_free(Bitset *bs)  { free(bs->bits); bs->bits = NULL; bs->n_bytes = bs->n_bits = 0; }
+void bitset_clear(Bitset *bs) { if (bs->bits) memset(bs->bits, 0, (size_t)bs->n_bytes); }
 void bitset_set(Bitset *bs, int idx) {
     if (idx < 0 || idx >= bs->n_bits) return;
     bs->bits[idx >> 3] |=  (uint8_t)(1u << (idx & 7));
@@ -238,10 +242,17 @@ int epochset_test(const EpochSet *es, int idx) {
 
 /* ══════════════════════════════════════════════════════════════════════════
  * CRC32 (IEEE 802.3 polynomial, 256-entry lookup table)
+ *
+ * The lookup table is initialised lazily on first use, but storage_write and
+ * storage_read_header may both be called concurrently (e.g. from independent
+ * PistaDB handles).  Without synchronisation, two threads could race on the
+ * `init = 1` write while another thread reads partially-written entries and
+ * computes a corrupt CRC.  Use the same one-shot primitive as the SIMD
+ * dispatcher so the first caller pays a small lock cost and every subsequent
+ * call is a plain function call.
  * ══════════════════════════════════════════════════════════════════════════ */
 
 static uint32_t crc32_table[256];
-static int crc32_table_init = 0;
 
 static void crc32_init_table(void) {
     for (uint32_t i = 0; i < 256; i++) {
@@ -250,11 +261,26 @@ static void crc32_init_table(void) {
             c = (c >> 1) ^ (0xEDB88320u & ((c & 1u) ? 0xFFFFFFFFu : 0u));
         crc32_table[i] = c;
     }
-    crc32_table_init = 1;
 }
 
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+static INIT_ONCE g_crc_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK crc32_once_cb(PINIT_ONCE o, PVOID p, PVOID *c)
+    { (void)o; (void)p; (void)c; crc32_init_table(); return TRUE; }
+static void crc32_ensure_init(void)
+    { InitOnceExecuteOnce(&g_crc_once, crc32_once_cb, NULL, NULL); }
+#else
+#  include <pthread.h>
+static pthread_once_t g_crc_once = PTHREAD_ONCE_INIT;
+static void crc32_ensure_init(void) { pthread_once(&g_crc_once, crc32_init_table); }
+#endif
+
 uint32_t crc32_compute(const void *data, size_t len) {
-    if (!crc32_table_init) crc32_init_table();
+    crc32_ensure_init();
     const uint8_t *p = (const uint8_t *)data;
     uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; i++)

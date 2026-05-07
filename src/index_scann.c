@@ -257,9 +257,20 @@ int scann_create(ScaNNIndex *idx, int dim, DistFn dist_fn, PistaDBMetric metric,
 
     if (!idx->centroids || !idx->codebooks || !idx->lists ||
         !idx->list_sizes || !idx->list_caps ||
-        !idx->all_ids || !idx->all_deleted)
+        !idx->all_ids || !idx->all_deleted) {
+        free(idx->centroids); free(idx->codebooks); free(idx->lists);
+        free(idx->list_sizes); free(idx->list_caps);
+        free(idx->all_ids); free(idx->all_deleted);
+        memset(idx, 0, sizeof(*idx));
         return PISTADB_ENOMEM;
-    if (vs_init(&idx->vs, 0, idx->vec_cap) != PISTADB_OK) return PISTADB_ENOMEM;
+    }
+    if (vs_init(&idx->vs, 0, idx->vec_cap) != PISTADB_OK) {
+        free(idx->centroids); free(idx->codebooks); free(idx->lists);
+        free(idx->list_sizes); free(idx->list_caps);
+        free(idx->all_ids); free(idx->all_deleted);
+        memset(idx, 0, sizeof(*idx));
+        return PISTADB_ENOMEM;
+    }
     return PISTADB_OK;
 }
 
@@ -721,9 +732,14 @@ int scann_load(ScaNNIndex *idx, const void *buf, size_t size,
     if (r != PISTADB_OK) return r;
     idx->trained = trained;
 
-    size_t cc_sz = sizeof(float) * (size_t)(nlist * dim);
+    size_t cc_sz = sizeof(float) * (size_t)nlist * (size_t)dim;
     size_t cb_sz = sizeof(float) *
-                   (size_t)(pq_M * idx->K_sub * idx->sub_dim);
+                   (size_t)pq_M * (size_t)idx->K_sub * (size_t)idx->sub_dim;
+    /* Bounds-check before memcpy — header CRC catches casual corruption but
+     * a malicious file with valid CRC could still trick us into reading past
+     * buf when nlist/pq_M/dim conspire to point past `size`. */
+    const uint8_t *buf_end = (const uint8_t *)buf + size;
+    if ((size_t)(buf_end - p) < cc_sz + cb_sz) return PISTADB_ECORRUPT;
     memcpy(idx->centroids, p, cc_sz); p += cc_sz;
     memcpy(idx->codebooks, p, cb_sz); p += cb_sz;
 
@@ -743,6 +759,8 @@ int scann_load(ScaNNIndex *idx, const void *buf, size_t size,
             idx->vec_cap = nc;
         }
     }
+    /* Per-vector header: 8 (id) + 1 (deleted) + 256 (label) = 265 bytes. */
+    if ((size_t)(buf_end - p) < (size_t)n_vecs * 265u) return PISTADB_ECORRUPT;
     for (int i = 0; i < n_vecs; i++) {
         idx->all_ids[i]     = RU64();
         idx->all_deleted[i] = *p++;
@@ -751,7 +769,7 @@ int scann_load(ScaNNIndex *idx, const void *buf, size_t size,
     idx->n_vecs = n_vecs;
 
     int esz = entry_sz(idx);
-    const uint8_t *end = (const uint8_t *)buf + size;
+    const uint8_t *end = buf_end;
     for (int c = 0; c < nlist; c++) {
         if ((size_t)(end - p) < 4) return PISTADB_ECORRUPT;
         int ls = RI32();

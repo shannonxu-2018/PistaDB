@@ -275,6 +275,10 @@ static int select_neighbors(Heap *W, int M, int *out, int *out_cnt) {
 /* ── INSERT ──────────────────────────────────────────────────────────────── */
 
 int hnsw_insert(HNSWIndex *idx, uint64_t id, const char *label, const float *vec) {
+    /* UINT64_MAX is reserved as the lazy-deletion tombstone (see hnsw_delete);
+     * accepting it as a real id would later be misread as a deleted node and
+     * be skipped by every search. */
+    if (id == UINT64_MAX) return PISTADB_EINVAL;
     if (idx->n_nodes == idx->node_cap) {
         int r = hnsw_grow(idx);
         if (r != PISTADB_OK) return r;
@@ -308,14 +312,18 @@ int hnsw_insert(HNSWIndex *idx, uint64_t id, const char *label, const float *vec
     HeapItem  c_stack[256];
     Heap   W, C;
     EpochSet visited;
+    int W_ok = 0, C_ok = 0, V_ok = 0;
     if (hcap_i <= (int)(sizeof w_stack / sizeof w_stack[0])) {
-        heap_init_with_buffer(&W, w_stack, hcap_i, 1);
-        heap_init_with_buffer(&C, c_stack, hcap_i, 0);
+        heap_init_with_buffer(&W, w_stack, hcap_i, 1); W_ok = 1;
+        heap_init_with_buffer(&C, c_stack, hcap_i, 0); C_ok = 1;
     } else {
-        heap_init(&W, hcap_i, 1);
-        heap_init(&C, hcap_i, 0);
+        if (heap_init(&W, hcap_i, 1) != PISTADB_OK) goto insert_oom;
+        W_ok = 1;
+        if (heap_init(&C, hcap_i, 0) != PISTADB_OK) goto insert_oom;
+        C_ok = 1;
     }
-    epochset_init(&visited, idx->node_cap + 8);
+    if (epochset_init(&visited, idx->node_cap + 8) != PISTADB_OK) goto insert_oom;
+    V_ok = 1;
 
     int ep = idx->ep_node;
     int L  = idx->max_layer;
@@ -389,6 +397,15 @@ int hnsw_insert(HNSWIndex *idx, uint64_t id, const char *label, const float *vec
     heap_free(&C);
     epochset_free(&visited);
     return PISTADB_OK;
+
+insert_oom:
+    if (W_ok) heap_free(&W);
+    if (C_ok) heap_free(&C);
+    if (V_ok) epochset_free(&visited);
+    /* The new node has been added to the graph already; leaving it without
+     * lower-layer connections is accepted as a graceful-degradation outcome.
+     * Surface ENOMEM so callers can react. */
+    return PISTADB_ENOMEM;
 }
 
 /* ── DELETE (lazy) ───────────────────────────────────────────────────────── */
@@ -434,15 +451,24 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
 
     Heap   W, C;
     EpochSet visited;
+    int W_ok = 0, C_ok = 0, V_ok = 0;
 
     if (hcap <= (int)(sizeof w_stack / sizeof w_stack[0])) {
-        heap_init_with_buffer(&W, w_stack, hcap, 1);
-        heap_init_with_buffer(&C, c_stack, hcap, 0);
+        heap_init_with_buffer(&W, w_stack, hcap, 1); W_ok = 1;
+        heap_init_with_buffer(&C, c_stack, hcap, 0); C_ok = 1;
     } else {
-        heap_init(&W, hcap, 1);
-        heap_init(&C, hcap, 0);
+        if (heap_init(&W, hcap, 1) != PISTADB_OK) return 0;
+        W_ok = 1;
+        if (heap_init(&C, hcap, 0) != PISTADB_OK) { heap_free(&W); return 0; }
+        C_ok = 1;
     }
-    epochset_init(&visited, idx->n_nodes + 8);
+    if (epochset_init(&visited, idx->n_nodes + 8) != PISTADB_OK) {
+        if (W_ok) heap_free(&W);
+        if (C_ok) heap_free(&C);
+        return 0;
+    }
+    V_ok = 1;
+    (void)V_ok;
 
     int ep = idx->ep_node;
     int L  = idx->max_layer;

@@ -408,14 +408,18 @@ int pistadb_batch_insert(PistaDB            *db,
     if (!b) return n;   /* could not create context — treat all as failed */
 
     const int dim = b->dim;
+    int push_errors = 0;
     for (int i = 0; i < n; i++) {
         const char  *lbl = (labels && labels[i]) ? labels[i] : NULL;
         const float *vec = vecs + (size_t)i * (size_t)dim;
-        /* push() blocks if the queue is full — natural back-pressure. */
-        pistadb_batch_push(b, ids[i], lbl, vec);
+        /* push() blocks if the queue is full — natural back-pressure.  ENOMEM
+         * (or post-shutdown ERR) is reported via the return value; previously
+         * those losses were silently dropped from the final error count. */
+        if (pistadb_batch_push(b, ids[i], lbl, vec) != PISTADB_OK)
+            push_errors++;
     }
 
-    int errors = pistadb_batch_flush(b);
+    int insert_errors = pistadb_batch_flush(b);
     pistadb_batch_destroy(b);
-    return errors;
+    return push_errors + insert_errors;
 }

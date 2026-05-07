@@ -290,6 +290,8 @@ fail:
 PistaDB *pistadb_open(const char *path, int dim,
                     PistaDBMetric metric, PistaDBIndexType index,
                     const PistaDBParams *params) {
+    if (!path || dim <= 0) return NULL;
+
     PistaDB *db = (PistaDB *)calloc(1, sizeof(PistaDB));
     if (!db) return NULL;
 
@@ -600,7 +602,21 @@ int pistadb_train(PistaDB *db) {
             IVFIndex *iv = &db->idx.ivf;
             /* Train on currently stored vectors */
             if (iv->n_vecs == 0) return PISTADB_EINVAL;
-            r = ivf_train(iv, VS_VEC(&iv->vs, 0), iv->n_vecs, 100);
+            /* Vectors are chunked — gather into a flat buffer for ivf_train,
+             * which expects a contiguous [n × dim] array.  Reading
+             * VS_VEC(&iv->vs, 0) directly works only while all vectors fit in
+             * the first chunk (≤ 131 072 entries); past that boundary it
+             * reads past the chunk into unrelated memory. */
+            size_t flat_bytes = (size_t)iv->n_vecs * (size_t)iv->dim * sizeof(float);
+            float *flat = (float *)malloc(flat_bytes);
+            if (!flat) { r = PISTADB_ENOMEM; break; }
+            for (int i = 0; i < iv->n_vecs; i++) {
+                memcpy(flat + (size_t)i * (size_t)iv->dim,
+                       VS_VEC(&iv->vs, i),
+                       sizeof(float) * (size_t)iv->dim);
+            }
+            r = ivf_train(iv, flat, iv->n_vecs, 100);
+            free(flat);
             break;
         }
         case INDEX_IVF_PQ: {
@@ -662,15 +678,22 @@ int pistadb_train_on(PistaDB *db, const float *train_vecs, int n_train) {
  *  Caller must free the returned buffer. */
 void *pistadb_results_to_buf(const PistaDBResult *res, int n, int *out_size) {
     size_t entry = sizeof(uint64_t) + sizeof(float) + 256;
+    /* entry is 268 bytes — not a multiple of 8.  Consecutive entries are
+     * therefore mis-aligned for direct uint64_t / float stores, which is
+     * undefined behaviour (and traps on strict-alignment ISAs).  Use memcpy
+     * so the layout stays bit-identical without UB. */
+    if (n <= 0 || !res) { if (out_size) *out_size = 0; return NULL; }
     uint8_t *buf = (uint8_t *)malloc(entry * (size_t)n);
-    if (!buf) { *out_size = 0; return NULL; }
+    if (!buf) { if (out_size) *out_size = 0; return NULL; }
     for (int i = 0; i < n; i++) {
         uint8_t *p = buf + (size_t)i * entry;
-        *(uint64_t *)p = res[i].id;        p += 8;
-        *(float    *)p = res[i].distance;  p += 4;
+        uint64_t id = res[i].id;
+        float    d  = res[i].distance;
+        memcpy(p,     &id, sizeof id);    p += sizeof id;
+        memcpy(p,     &d,  sizeof d);     p += sizeof d;
         memcpy(p, res[i].label, 256);
     }
-    *out_size = (int)(entry * (size_t)n);
+    if (out_size) *out_size = (int)(entry * (size_t)n);
     return buf;
 }
 

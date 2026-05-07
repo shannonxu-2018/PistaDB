@@ -47,9 +47,20 @@ int ivf_create(IVFIndex *idx, int dim, DistFn dist_fn, int nlist, int nprobe) {
     idx->vec_deleted=(uint8_t  *)calloc((size_t)idx->vec_cap, 1);
 
     if (!idx->centroids || !idx->lists || !idx->list_sizes || !idx->list_caps ||
-        !idx->vec_ids || !idx->vec_deleted)
+        !idx->vec_ids || !idx->vec_deleted) {
+        free(idx->centroids); free(idx->lists);
+        free(idx->list_sizes); free(idx->list_caps);
+        free(idx->vec_ids);   free(idx->vec_deleted);
+        memset(idx, 0, sizeof(*idx));
         return PISTADB_ENOMEM;
-    if (vs_init(&idx->vs, dim, idx->vec_cap) != PISTADB_OK) return PISTADB_ENOMEM;
+    }
+    if (vs_init(&idx->vs, dim, idx->vec_cap) != PISTADB_OK) {
+        free(idx->centroids); free(idx->lists);
+        free(idx->list_sizes); free(idx->list_caps);
+        free(idx->vec_ids);   free(idx->vec_deleted);
+        memset(idx, 0, sizeof(*idx));
+        return PISTADB_ENOMEM;
+    }
     return PISTADB_OK;
 }
 
@@ -267,7 +278,11 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
     /* Scan selected centroids and collect k-best.  We store the internal
      * slot in heap.id so the post-processing step below can look up id and
      * label directly without an O(n_vecs) linear scan per result. */
-    Heap heap; heap_init(&heap, k + 4, 1);  /* max-heap */
+    Heap heap;
+    if (heap_init(&heap, k + 4, 1) != PISTADB_OK) {  /* max-heap */
+        if (c_order_owned) free(c_order);
+        return 0;
+    }
     {
         enum { BATCH = 256 };
         const float *ptrs [BATCH];
@@ -430,7 +445,11 @@ int ivf_load(IVFIndex *idx, const void *buf, size_t size, int dim, DistFn dist_f
         idx->list_sizes[c] = ls;
         for (int j = 0; j < ls; j++) {
             idx->lists[c][j].id   = RU64();
-            idx->lists[c][j].slot = RI32();
+            int32_t s             = RI32();
+            /* Reject slots that point outside the vector store — silent
+             * corruption here would cause OOB reads in ivf_search. */
+            if (s < 0 || s >= n_vecs) return PISTADB_ECORRUPT;
+            idx->lists[c][j].slot = s;
         }
     }
 #undef RI32

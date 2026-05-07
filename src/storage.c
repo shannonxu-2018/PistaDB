@@ -14,15 +14,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
 /* 64-bit fseek: fseek(long) is 32-bit on Windows, silently truncates >2GB offsets. */
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  include <io.h>
 #  define FSEEK64(f, off, whence) _fseeki64((f), (__int64)(off), (whence))
 #else
+#  include <unistd.h>
 #  define FSEEK64(f, off, whence) fseeko((f), (off_t)(off), (whence))
 #endif
+
+/* Flush OS buffers to physical media before fclose so that the rename below
+ * does not promote an empty/truncated file in case of a power loss between
+ * fwrite and the kernel's writeback. */
+static int fsync_file(FILE *f)
+{
+#ifdef _WIN32
+    HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    return FlushFileBuffers(h) ? 1 : 0;
+#else
+    int fd = fileno(f);
+    if (fd < 0) return 0;
+    return fsync(fd) == 0 ? 1 : 0;
+#endif
+}
 
 /* ── Temp-file name: append ".tmp" to path ───────────────────────────────── */
 static char *make_tmp_path(const char *path)
@@ -70,7 +89,10 @@ int storage_write(const char *path,
     ok = ok && (fwrite(vec_buf, 1, vec_size,    f) == vec_size);
     ok = ok && (fwrite(idx_buf, 1, idx_size,    f) == idx_size);
     ok = ok && (fflush(f) == 0);
-    fclose(f);
+    /* fsync before close+rename so a crash here cannot promote a file whose
+     * data is still sitting in the kernel write cache. */
+    ok = ok && fsync_file(f);
+    if (fclose(f) != 0) ok = 0;
 
     if (ok) {
         /* Atomic rename: destination is replaced in a single filesystem op. */
@@ -116,6 +138,20 @@ int storage_read_header(const char *path, PistaDBFileHeader *hdr) {
 int storage_read_sections(const char *path, const PistaDBFileHeader *hdr,
                           void **vec_buf, size_t *vec_size,
                           void **idx_buf, size_t *idx_size) {
+    *vec_buf = *idx_buf = NULL;
+    *vec_size = *idx_size = 0;
+
+    /* The header is CRC-protected, but a maliciously crafted file (or a
+     * disk-bit-flip that happens to keep the CRC valid) could still set
+     * vec_size / idx_size to values that overflow size_t when we add 1
+     * for the trailing slack byte, leading to a tiny malloc followed by a
+     * huge fread = heap buffer overflow.  Refuse anything close to the
+     * SIZE_MAX boundary up front. */
+    if (hdr->vec_size > (uint64_t)(SIZE_MAX - 1) ||
+        hdr->idx_size > (uint64_t)(SIZE_MAX - 1)) {
+        return PISTADB_ECORRUPT;
+    }
+
     FILE *f = fopen(path, "rb");
     if (!f) return PISTADB_EIO;
 
@@ -125,6 +161,7 @@ int storage_read_sections(const char *path, const PistaDBFileHeader *hdr,
     *idx_buf  = malloc(*idx_size + 1);
     if (!*vec_buf || !*idx_buf) {
         free(*vec_buf); free(*idx_buf);
+        *vec_buf = *idx_buf = NULL;
         fclose(f); return PISTADB_ENOMEM;
     }
 

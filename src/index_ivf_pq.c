@@ -108,9 +108,20 @@ int ivfpq_create(IVFPQIndex *idx, int dim, DistFn dist_fn,
 
     if (!idx->coarse_centroids || !idx->codebooks || !idx->pq_lists ||
         !idx->list_sizes || !idx->list_caps ||
-        !idx->all_ids || !idx->all_deleted)
+        !idx->all_ids || !idx->all_deleted) {
+        free(idx->coarse_centroids); free(idx->codebooks);
+        free(idx->pq_lists); free(idx->list_sizes); free(idx->list_caps);
+        free(idx->all_ids); free(idx->all_deleted);
+        memset(idx, 0, sizeof(*idx));
         return PISTADB_ENOMEM;
-    if (vs_init(&idx->vs, 0, idx->vec_cap) != PISTADB_OK) return PISTADB_ENOMEM;
+    }
+    if (vs_init(&idx->vs, 0, idx->vec_cap) != PISTADB_OK) {
+        free(idx->coarse_centroids); free(idx->codebooks);
+        free(idx->pq_lists); free(idx->list_sizes); free(idx->list_caps);
+        free(idx->all_ids); free(idx->all_deleted);
+        memset(idx, 0, sizeof(*idx));
+        return PISTADB_ENOMEM;
+    }
     return PISTADB_OK;
 }
 
@@ -382,7 +393,11 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
     }
 
     /* Heap stores slot in id field so post-processing has O(1) label lookup. */
-    Heap heap; heap_init(&heap, k + 4, 1);
+    Heap heap;
+    if (heap_init(&heap, k + 4, 1) != PISTADB_OK) {
+        free(c_dists); free(c_order); free(lut); free(qres); free(idmap); free(seen_slot);
+        return 0;
+    }
 
     int entry_size = 8 + idx->M;
     for (int pi = 0; pi < idx->nprobe && pi < idx->nlist; pi++) {

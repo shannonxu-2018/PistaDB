@@ -87,6 +87,7 @@ static void sq_requantize_all(SQIndex *idx,
 
 int sq_create(SQIndex *idx, int dim, DistFn dist_fn, int initial_cap) {
     if (initial_cap <= 0) initial_cap = SQ_INITIAL_CAP;
+    memset(idx, 0, sizeof(*idx));
     idx->dim     = dim;
     idx->dist_fn = dist_fn;
     idx->size    = 0;
@@ -101,6 +102,7 @@ int sq_create(SQIndex *idx, int dim, DistFn dist_fn, int initial_cap) {
     if (!idx->codes || !idx->ids || !idx->deleted || !idx->vmin || !idx->vmax) {
         free(idx->codes); free(idx->ids); free(idx->deleted);
         free(idx->vmin); free(idx->vmax);
+        memset(idx, 0, sizeof(*idx));
         return PISTADB_ENOMEM;
     }
 
@@ -110,7 +112,12 @@ int sq_create(SQIndex *idx, int dim, DistFn dist_fn, int initial_cap) {
         idx->vmax[d] = -FLT_MAX;
     }
 
-    if (vs_init(&idx->vs, 0, initial_cap) != PISTADB_OK) return PISTADB_ENOMEM;
+    if (vs_init(&idx->vs, 0, initial_cap) != PISTADB_OK) {
+        free(idx->codes); free(idx->ids); free(idx->deleted);
+        free(idx->vmin); free(idx->vmax);
+        memset(idx, 0, sizeof(*idx));
+        return PISTADB_ENOMEM;
+    }
     return PISTADB_OK;
 }
 

@@ -75,7 +75,8 @@ static void greedy_search(const DiskANNIndex *idx, const float *query,
     heap_clear(result);
     bitset_clear(visited);
 
-    Heap cand; heap_init(&cand, L * 2 + 8, 0);  /* min-heap */
+    Heap cand;
+    if (heap_init(&cand, L * 2 + 8, 0) != PISTADB_OK) return;  /* min-heap */
 
     float d0 = query_dist_da(idx, query, start);
     heap_push(&cand,   d0, (uint64_t)start);
@@ -194,32 +195,41 @@ int diskann_insert(DiskANNIndex *idx, uint64_t id, const char *label, const floa
 
     if (p == 0) { idx->medoid = 0; return PISTADB_OK; }
 
-    /* Greedy search from medoid */
-    Heap result; heap_init(&result, idx->L * 2 + 8, 1);
-    Bitset visited; bitset_init(&visited, idx->n_nodes + 8);
+    /* Greedy search from medoid — bail with ENOMEM rather than dereferencing
+     * NULL when any of these scratch allocations fails. */
+    Heap result;   if (heap_init(&result, idx->L * 2 + 8, 1) != PISTADB_OK) return PISTADB_ENOMEM;
+    Bitset visited; if (bitset_init(&visited, idx->n_nodes + 8) != PISTADB_OK) { heap_free(&result); return PISTADB_ENOMEM; }
 
     greedy_search(idx, vec, idx->medoid, idx->L, &result, &visited);
 
     /* Sort result ascending */
     int total = result.size;
-    float *ds = (float *)malloc(sizeof(float) * (size_t)total);
-    int   *ns = (int   *)malloc(sizeof(int)   * (size_t)total);
+    float *ds     = (float *)malloc(sizeof(float) * (size_t)(total ? total : 1));
+    int   *ns     = (int   *)malloc(sizeof(int)   * (size_t)(total ? total : 1));
+    int   *chosen = (int   *)malloc(sizeof(int)   * (size_t)(idx->R + 4));
+    if (!ds || !ns || !chosen) {
+        free(ds); free(ns); free(chosen);
+        heap_free(&result); bitset_free(&visited);
+        return PISTADB_ENOMEM;
+    }
     for (int i = total - 1; i >= 0; i--) {
         HeapItem it = heap_pop(&result);
         ds[i] = it.key; ns[i] = (int)it.id;
     }
 
     /* Prune to R neighbors */
-    int *chosen = (int *)malloc(sizeof(int) * (size_t)(idx->R + 4));
     int  chosen_cnt = 0;
     robust_prune(idx, p, ds, ns, total, idx->R, idx->alpha, chosen, &chosen_cnt);
 
     node_set_neighbors(&idx->nodes[p], chosen, chosen_cnt);
 
-    /* Pre-allocate buffers for bidirectional pruning — reused across all chosen neighbors. */
+    /* Pre-allocate buffers for bidirectional pruning — reused across all chosen
+     * neighbors.  Treat any allocation failure as "skip pruning" rather than
+     * leaving partial pruning state behind; the graph remains correct, just
+     * slightly over-degree on the affected nodes. */
     int    max_nc = idx->R + 1;   /* nc ≤ R+1 after node_add_nb on a list capped at R */
-    float *nds    = (float *)malloc(sizeof(float) * (size_t)max_nc);
-    int   *nns    = (int   *)malloc(sizeof(int)   * (size_t)max_nc);
+    float *nds    = (float *)malloc(sizeof(float) * (size_t)(max_nc + 1));
+    int   *nns    = (int   *)malloc(sizeof(int)   * (size_t)(max_nc + 1));
     int   *pruned = (int   *)malloc(sizeof(int)   * (size_t)(idx->R + 4));
 
     /* Bidirectional: add p as neighbor of each chosen */
@@ -300,8 +310,14 @@ int diskann_build(DiskANNIndex *idx) {
         int t = order[i]; order[i] = order[j]; order[j] = t;
     }
 
-    Heap result; heap_init(&result, idx->L * 2 + 8, 1);
-    Bitset visited; bitset_init(&visited, idx->n_nodes + 8);
+    Heap result;
+    if (heap_init(&result, idx->L * 2 + 8, 1) != PISTADB_OK) {
+        free(order); return PISTADB_ENOMEM;
+    }
+    Bitset visited;
+    if (bitset_init(&visited, idx->n_nodes + 8) != PISTADB_OK) {
+        heap_free(&result); free(order); return PISTADB_ENOMEM;
+    }
 
     for (int oi = 0; oi < idx->n_nodes; oi++) {
         int p = order[oi];
@@ -311,14 +327,19 @@ int diskann_build(DiskANNIndex *idx) {
         greedy_search(idx, vec, medoid, idx->L, &result, &visited);
 
         int total = result.size;
-        float *ds = (float *)malloc(sizeof(float) * (size_t)total);
-        int   *ns = (int   *)malloc(sizeof(int)   * (size_t)total);
+        float *ds     = (float *)malloc(sizeof(float) * (size_t)(total ? total : 1));
+        int   *ns     = (int   *)malloc(sizeof(int)   * (size_t)(total ? total : 1));
+        int   *chosen = (int   *)malloc(sizeof(int)   * (size_t)(idx->R + 4));
+        if (!ds || !ns || !chosen) {
+            free(ds); free(ns); free(chosen);
+            heap_clear(&result); bitset_clear(&visited);
+            continue;  /* skip this node — graph stays correct, just lower quality */
+        }
         for (int i = total - 1; i >= 0; i--) {
             HeapItem it = heap_pop(&result);
             ds[i] = it.key; ns[i] = (int)it.id;
         }
 
-        int *chosen = (int *)malloc(sizeof(int) * (size_t)(idx->R + 4));
         int  chosen_cnt = 0;
         robust_prune(idx, p, ds, ns, total, idx->R, idx->alpha, chosen, &chosen_cnt);
         node_set_neighbors(&idx->nodes[p], chosen, chosen_cnt);
@@ -360,8 +381,12 @@ int diskann_search(DiskANNIndex *idx, const float *query, int k,
     if (idx->n_nodes == 0 || idx->medoid < 0) return 0;
 
     int L = (idx->L > k) ? idx->L : k;
-    Heap result; heap_init(&result, L * 2 + 8, 1);
-    Bitset visited; bitset_init(&visited, idx->n_nodes + 8);
+    Heap result;
+    if (heap_init(&result, L * 2 + 8, 1) != PISTADB_OK) return 0;
+    Bitset visited;
+    if (bitset_init(&visited, idx->n_nodes + 8) != PISTADB_OK) {
+        heap_free(&result); return 0;
+    }
 
     greedy_search(idx, query, idx->medoid, L, &result, &visited);
 
