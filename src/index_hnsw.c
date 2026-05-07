@@ -176,6 +176,12 @@ static int search_layer(const HNSWIndex *idx, const float *query,
             if (nb < 0 || nb >= idx->n_nodes) continue;
             if (bitset_test(visited, nb)) continue;
             bitset_set(visited, nb);
+            /* Tombstoned node — same vec_id == UINT64_MAX sentinel as
+             * hnsw_delete().  Skip the distance call and do not enqueue
+             * into C/W: it would only be filtered at result-extraction
+             * time anyway.  Side-effect: we no longer traverse through
+             * deleted nodes, which is fine at the M values we use here. */
+            if (idx->nodes[nb].vec_id == UINT64_MAX) continue;
 
             float d_nb = query_dist(idx, query, nb);
             float w_far2 = heap_top(W).key;
