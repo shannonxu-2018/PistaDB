@@ -38,10 +38,11 @@ typedef struct {
     int       n_vecs;
     int       vec_cap;
 
-    int       dim;
-    DistFn    dist_fn;
-    int       nprobe;        /* centroids to search at query time */
-    int       trained;       /* 0 = not trained */
+    int          dim;
+    DistFn       dist_fn;
+    BatchDistFn  batch_fn;   /* may be NULL → fallback to per-pair dist_fn */
+    int          nprobe;        /* centroids to search at query time */
+    int          trained;       /* 0 = not trained */
 } IVFIndex;
 
 /**

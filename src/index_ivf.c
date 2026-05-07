@@ -32,6 +32,7 @@ int ivf_create(IVFIndex *idx, int dim, DistFn dist_fn, int nlist, int nprobe) {
     memset(idx, 0, sizeof(*idx));
     idx->dim      = dim;
     idx->dist_fn  = dist_fn;
+    idx->batch_fn = NULL;          /* set by pistadb.c after create / load */
     idx->nlist    = nlist;
     idx->nprobe   = nprobe < nlist ? nprobe : nlist;
     idx->trained  = 0;
@@ -267,17 +268,41 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
      * slot in heap.id so the post-processing step below can look up id and
      * label directly without an O(n_vecs) linear scan per result. */
     Heap heap; heap_init(&heap, k + 4, 1);  /* max-heap */
-    for (int pi = 0; pi < n_selected; pi++) {
-        int c = c_order[pi];
-        for (int j = 0; j < idx->list_sizes[c]; j++) {
-            IVFPosting p = idx->lists[c][j];
-            if (idx->vec_deleted[p.slot]) continue;
-            float d = idx->dist_fn(query, VS_VEC(&idx->vs, p.slot), idx->dim);
-            if (heap.size < k) {
-                heap_push(&heap, d, (uint64_t)p.slot);
-            } else if (d < heap_top(&heap).key) {
-                heap_pop(&heap);
-                heap_push(&heap, d, (uint64_t)p.slot);
+    {
+        enum { BATCH = 256 };
+        const float *ptrs [BATCH];
+        int          slots[BATCH];
+        float        dbuf [BATCH];
+        for (int pi = 0; pi < n_selected; pi++) {
+            int c    = c_order[pi];
+            int lsz  = idx->list_sizes[c];
+            int j    = 0;
+            while (j < lsz) {
+                int n = 0;
+                while (j < lsz && n < BATCH) {
+                    IVFPosting p = idx->lists[c][j++];
+                    if (idx->vec_deleted[p.slot]) continue;
+                    ptrs [n] = VS_VEC(&idx->vs, p.slot);
+                    slots[n] = p.slot;
+                    n++;
+                }
+                if (n == 0) continue;
+                if (idx->batch_fn) {
+                    idx->batch_fn(query, ptrs, (size_t)n, idx->dim, dbuf);
+                } else {
+                    for (int t = 0; t < n; t++)
+                        dbuf[t] = idx->dist_fn(query, ptrs[t], idx->dim);
+                }
+                for (int t = 0; t < n; t++) {
+                    float d = dbuf[t];
+                    int   s = slots[t];
+                    if (heap.size < k) {
+                        heap_push(&heap, d, (uint64_t)s);
+                    } else if (d < heap_top(&heap).key) {
+                        heap_pop(&heap);
+                        heap_push(&heap, d, (uint64_t)s);
+                    }
+                }
             }
         }
     }

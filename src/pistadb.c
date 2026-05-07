@@ -103,6 +103,7 @@ static int create_index(PistaDB *db) {
         case INDEX_IVF:
             r = ivf_create(&db->idx.ivf, db->dim, fn,
                            p->ivf_nlist, p->ivf_nprobe);
+            if (r == PISTADB_OK) db->idx.ivf.batch_fn = bfn;
             break;
         case INDEX_IVF_PQ:
             r = ivfpq_create(&db->idx.ivfpq, db->dim, fn,
@@ -233,6 +234,7 @@ static int load_from_file(PistaDB *db) {
             break;
         case INDEX_IVF:
             r = ivf_load(&db->idx.ivf, vec_buf, vec_sz, db->dim, fn);
+            if (r == PISTADB_OK) db->idx.ivf.batch_fn = bfn;
             break;
         case INDEX_IVF_PQ:
             r = ivfpq_load(&db->idx.ivfpq, vec_buf, vec_sz, db->dim, fn);
