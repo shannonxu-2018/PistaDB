@@ -281,8 +281,15 @@ int sq_search(const SQIndex *idx, const float *query, int k,
      * the true L2² distance only when every dimension shares the same scale,
      * which is not the case for per-dim min/max.  Be safe and dequantise into
      * a scratch buffer, then use the distance function the caller asked for.
-     * 4-byte temp per query — negligible.  */
-    float *cand = (float *)malloc(sizeof(float) * (size_t)idx->dim);
+     *
+     * Stack-allocate the scratch buffer for the common embedding-size range
+     * (dim ≤ 1024 covers OpenAI / Cohere / sentence-transformers) and fall
+     * back to heap for larger configurations.  Removes the per-search
+     * malloc/free pair on the hot path while staying thread-safe.  Mirrors
+     * the pattern already used in index_ivf_pq.c. */
+    float  cand_stack[1024];
+    float *cand = (idx->dim <= 1024) ? cand_stack
+                                     : (float *)malloc(sizeof(float) * (size_t)idx->dim);
     if (!cand) return 0;
 
     DistFn dfn = idx->dist_fn ? idx->dist_fn : dist_l2;
@@ -294,7 +301,7 @@ int sq_search(const SQIndex *idx, const float *query, int k,
         float d = dfn(query, cand, idx->dim);
         sq_result_insert(results, &cnt, k, idx->ids[i], d, VS_LABEL(&idx->vs, i));
     }
-    free(cand);
+    if (cand != cand_stack) free(cand);
 
     /* O(k log k) final sort; the partial-result heap above only kept the top
      * k as a max-heap-like array, so we still need to order ascending. */
