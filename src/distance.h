@@ -47,6 +47,18 @@ typedef float (*DistFn)(const float *, const float *, int);
 /** Return the distance function for the given metric type. */
 DistFn pistadb_get_dist_fn(PistaDBMetric metric);
 
+/**
+ * Return a *ranking*-equivalent distance function for the given metric.
+ *
+ * For METRIC_L2 this returns dist_l2sq (squared L2) — sqrt is monotone over
+ * non-negative values, so heap comparisons / top-K orderings are identical
+ * but per-call cost drops by one sqrtf.  Callers that surface distances to
+ * the user must apply sqrtf to the final K results to recover Euclidean
+ * units.  For all other metrics this returns the same function pointer as
+ * pistadb_get_dist_fn().
+ */
+DistFn pistadb_get_rank_dist_fn(PistaDBMetric metric);
+
 /** Inner-product helper (raw dot product, not distance). */
 float vec_dot(const float *a, const float *b, int dim);
 

@@ -19,6 +19,7 @@
 #include "index_scann.h"
 #include "index_sq.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -80,7 +81,12 @@ static const char *err_str(int code) {
 /* ── Create new empty index ──────────────────────────────────────────────── */
 
 static int create_index(PistaDB *db) {
-    DistFn fn  = pistadb_get_dist_fn(db->metric);
+    /* Ranking-equivalent distance: drops sqrt for L2.  pistadb_search()
+     * post-processes the user-facing top-K with sqrtf below to keep the
+     * external L2 magnitude bit-identical to before the optimisation.
+     * IVF_PQ never uses this dist_fn for ranking (ADC LUT does); passing
+     * the rank variant is a no-op for that index. */
+    DistFn fn  = pistadb_get_rank_dist_fn(db->metric);
     PistaDBParams *p = &db->params;
     int r;
 
@@ -205,7 +211,8 @@ static int load_from_file(PistaDB *db) {
     db->index_type = (PistaDBIndexType)hdr.index_type;
     db->next_id    = hdr.next_id;
     db->n_total    = hdr.num_vectors;
-    db->dist_fn    = pistadb_get_dist_fn(db->metric);
+    /* Ranking-equivalent dist fn (see create_index for rationale). */
+    db->dist_fn    = pistadb_get_rank_dist_fn(db->metric);
 
     void *vec_buf = NULL, *idx_buf = NULL;
     size_t vec_sz = 0, idx_sz = 0;
@@ -281,7 +288,7 @@ PistaDB *pistadb_open(const char *path, int dim,
     db->metric     = metric;
     db->index_type = index;
     db->params     = params ? *params : pistadb_default_params();
-    db->dist_fn    = pistadb_get_dist_fn(metric);
+    db->dist_fn    = pistadb_get_rank_dist_fn(metric);
     db->next_id    = 1;
     db->n_total    = 0;
 
@@ -559,6 +566,17 @@ int pistadb_search(PistaDB *db, const float *query, int k,
             break;
         default:
             r = 0;
+    }
+    /* Indexes whose dist_fn was switched to dist_l2sq for ranking now report
+     * squared L2 in result.distance.  Recover Euclidean units here so the
+     * external API stays bit-identical for METRIC_L2.  IVF_PQ is excluded
+     * because its ADC ranking has always returned the L2² magnitude — sqrt-ing
+     * it would be a behavioural change. */
+    if (r > 0 && db->metric == METRIC_L2 && db->index_type != INDEX_IVF_PQ) {
+        for (int i = 0; i < r; i++) {
+            float d = results[i].distance;
+            results[i].distance = (d > 0.0f) ? sqrtf(d) : 0.0f;
+        }
     }
     return r;
 }

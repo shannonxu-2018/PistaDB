@@ -236,3 +236,12 @@ DistFn pistadb_get_dist_fn(PistaDBMetric metric) {
         default:             return active_dist_l2;
     }
 }
+
+/* Ranking-equivalent variant: sqrt is skipped for L2.  Callers that expose
+ * distances to the user must apply sqrtf to the final K results.  Other
+ * metrics fall through to the regular dispatcher. */
+DistFn pistadb_get_rank_dist_fn(PistaDBMetric metric) {
+    simd_init();
+    if (metric == METRIC_L2) return active_dist_l2sq;
+    return pistadb_get_dist_fn(metric);
+}
