@@ -16,13 +16,14 @@
 #include <stdint.h>
 
 typedef struct {
-    VecStore  vs;           /* chunked vector + label storage  */
-    uint64_t *ids;          /* parallel id array               */
-    uint8_t  *deleted;      /* 1 = logically deleted           */
-    int       size;         /* current number of entries       */
-    int       cap;          /* allocated capacity              */
-    int       dim;
-    DistFn    dist_fn;
+    VecStore     vs;        /* chunked vector + label storage  */
+    uint64_t    *ids;       /* parallel id array               */
+    uint8_t     *deleted;   /* 1 = logically deleted           */
+    int          size;      /* current number of entries       */
+    int          cap;       /* allocated capacity              */
+    int          dim;
+    DistFn       dist_fn;
+    BatchDistFn  batch_fn;  /* may be NULL → falls back to dist_fn loop */
 } LinearIndex;
 
 int  linear_create(LinearIndex *idx, int dim, DistFn dist_fn, int initial_cap);

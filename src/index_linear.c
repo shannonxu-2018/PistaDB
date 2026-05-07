@@ -17,10 +17,11 @@
 
 int linear_create(LinearIndex *idx, int dim, DistFn dist_fn, int initial_cap) {
     if (initial_cap <= 0) initial_cap = INITIAL_CAP;
-    idx->dim     = dim;
-    idx->dist_fn = dist_fn;
-    idx->size    = 0;
-    idx->cap     = initial_cap;
+    idx->dim      = dim;
+    idx->dist_fn  = dist_fn;
+    idx->batch_fn = NULL;       /* set by pistadb.c after create / load */
+    idx->size     = 0;
+    idx->cap      = initial_cap;
 
     idx->ids     = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)initial_cap);
     idx->deleted = (uint8_t  *)calloc((size_t)initial_cap, 1);
@@ -134,10 +135,45 @@ static int linear_cmp_result(const void *a, const void *b) {
 int linear_search(const LinearIndex *idx, const float *query, int k,
                   PistaDBResult *results) {
     int cnt = 0;
-    for (int i = 0; i < idx->size; i++) {
-        if (idx->deleted[i]) continue;
-        float d = idx->dist_fn(query, VS_VEC(&idx->vs, i), idx->dim);
-        result_insert(results, &cnt, k, idx->ids[i], d, VS_LABEL(&idx->vs, i));
+
+    if (idx->batch_fn) {
+        /* Batched path: gather up to 256 live entries' vector pointers, then
+         * call the batch dist kernel once.  Removes the dispatch / fn-pointer
+         * load from the inner loop and lets the kernel prefetch the next
+         * candidate while computing the current one.  Bit-identical to the
+         * per-pair fallback below. */
+        enum { BATCH = 256 };
+        const float *ptrs [BATCH];
+        int          slots[BATCH];
+        float        dbuf [BATCH];
+
+        int i = 0;
+        while (i < idx->size) {
+            int n = 0;
+            while (i < idx->size && n < BATCH) {
+                if (!idx->deleted[i]) {
+                    ptrs [n] = VS_VEC(&idx->vs, i);
+                    slots[n] = i;
+                    n++;
+                }
+                i++;
+            }
+            if (n == 0) continue;
+            idx->batch_fn(query, ptrs, (size_t)n, idx->dim, dbuf);
+            for (int j = 0; j < n; j++) {
+                int s = slots[j];
+                result_insert(results, &cnt, k, idx->ids[s], dbuf[j],
+                              VS_LABEL(&idx->vs, s));
+            }
+        }
+    } else {
+        /* Fallback: per-pair dispatch (used when batch_fn was not wired). */
+        for (int i = 0; i < idx->size; i++) {
+            if (idx->deleted[i]) continue;
+            float d = idx->dist_fn(query, VS_VEC(&idx->vs, i), idx->dim);
+            result_insert(results, &cnt, k, idx->ids[i], d,
+                          VS_LABEL(&idx->vs, i));
+        }
     }
     /* result_insert maintains a max-heap-by-distance shape, so we still need
      * a final ascending sort.  Use qsort (O(k log k)) instead of the prior

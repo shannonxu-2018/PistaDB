@@ -86,13 +86,15 @@ static int create_index(PistaDB *db) {
      * external L2 magnitude bit-identical to before the optimisation.
      * IVF_PQ never uses this dist_fn for ranking (ADC LUT does); passing
      * the rank variant is a no-op for that index. */
-    DistFn fn  = pistadb_get_rank_dist_fn(db->metric);
+    DistFn      fn   = pistadb_get_rank_dist_fn(db->metric);
+    BatchDistFn bfn  = pistadb_get_batch_rank_dist_fn(db->metric);
     PistaDBParams *p = &db->params;
     int r;
 
     switch (db->index_type) {
         case INDEX_LINEAR:
             r = linear_create(&db->idx.linear, db->dim, fn, 64);
+            if (r == PISTADB_OK) db->idx.linear.batch_fn = bfn;
             break;
         case INDEX_HNSW:
             r = hnsw_create(&db->idx.hnsw, db->dim, fn,
@@ -219,10 +221,12 @@ static int load_from_file(PistaDB *db) {
     r = storage_read_sections(db->path, &hdr, &vec_buf, &vec_sz, &idx_buf, &idx_sz);
     if (r != PISTADB_OK) goto fail;
 
-    DistFn fn = db->dist_fn;
+    DistFn      fn  = db->dist_fn;
+    BatchDistFn bfn = pistadb_get_batch_rank_dist_fn(db->metric);
     switch (db->index_type) {
         case INDEX_LINEAR:
             r = linear_load(&db->idx.linear, vec_buf, vec_sz, db->dim, fn);
+            if (r == PISTADB_OK) db->idx.linear.batch_fn = bfn;
             break;
         case INDEX_HNSW:
             r = hnsw_load(&db->idx.hnsw, vec_buf, vec_sz, db->dim, fn);
