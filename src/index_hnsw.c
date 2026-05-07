@@ -14,6 +14,18 @@
 #include <math.h>
 #include <float.h>
 
+/* Cross-platform read-prefetch for hot HNSW fan-out paths.  No-op when the
+ * compiler does not expose an intrinsic — prefetches are advisory and never
+ * affect correctness. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define PISTA_PREFETCH(p) __builtin_prefetch((const void *)(p), 0, 1)
+#elif defined(_MSC_VER)
+#  include <xmmintrin.h>
+#  define PISTA_PREFETCH(p) _mm_prefetch((const char *)(p), _MM_HINT_T1)
+#else
+#  define PISTA_PREFETCH(p) ((void)0)
+#endif
+
 /* ── PCG RNG (module-level) ─────────────────────────────────────────────── */
 static PCG g_rng;
 static int g_rng_init = 0;
@@ -171,8 +183,18 @@ static int search_layer(const HNSWIndex *idx, const float *query,
         const HNSWNode *cn = &idx->nodes[c_idx];
         if (layer > cn->level) continue;
 
-        for (int j = 0; j < cn->neighbor_cnt[layer]; j++) {
+        const int n_nb = cn->neighbor_cnt[layer];
+        for (int j = 0; j < n_nb; j++) {
             int nb = cn->neighbors[layer][j];
+            /* Prefetch the *next* neighbor's vector while we work on `nb` —
+             * the distance kernel is FMA-bound at high dim and benefits from
+             * having the cache line in flight one iteration ahead. */
+            if (j + 1 < n_nb) {
+                int nb_next = cn->neighbors[layer][j + 1];
+                if (nb_next >= 0 && nb_next < idx->n_nodes) {
+                    PISTA_PREFETCH(VS_VEC(&idx->vs, nb_next));
+                }
+            }
             if (nb < 0 || nb >= idx->n_nodes) continue;
             if (epochset_test(visited, nb)) continue;
             epochset_set(visited, nb);
