@@ -28,11 +28,23 @@ typedef struct {
     HeapItem *data;
     int       size;
     int       cap;
-    int       is_max;   /* 0 = min-heap, 1 = max-heap */
+    int       is_max;       /* 0 = min-heap, 1 = max-heap */
+    int       owned;        /* 1 = data was malloc'd by us; 0 = caller buffer */
 } Heap;
 
 /** Initialise heap.  is_max: 0 = min, 1 = max. */
 int  heap_init(Heap *h, int capacity, int is_max);
+
+/**
+ * Initialise a heap that uses a caller-provided HeapItem buffer (no malloc).
+ * If heap_push later overflows the buffer, the heap transparently grows by
+ * heap-allocating a fresh array and copying the contents — caller's buffer
+ * stays untouched.  heap_free() frees only the heap-owned grow buffer.
+ *
+ * Lets hot paths like hnsw_search keep heap state on the stack and avoid
+ * per-call malloc/free for the common case.
+ */
+int  heap_init_with_buffer(Heap *h, HeapItem *buf, int capacity, int is_max);
 
 /** Free heap memory. */
 void heap_free(Heap *h);

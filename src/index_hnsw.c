@@ -272,13 +272,24 @@ int hnsw_insert(HNSWIndex *idx, uint64_t id, const char *label, const float *vec
         return PISTADB_OK;
     }
 
-    /* Work buffers */
+    /* Work buffers — same stack-fallback pattern as hnsw_search().  Insert
+     * runs less frequently than search, so the win here is smaller, but
+     * removing two malloc/free pairs per insert keeps batch insert latency
+     * down. */
     int max_ef = (idx->ef_construction > idx->M_max0 * 4) ?
                   idx->ef_construction : idx->M_max0 * 4;
+    int hcap_i = max_ef + 8;
+    HeapItem  w_stack[256];
+    HeapItem  c_stack[256];
     Heap   W, C;
     EpochSet visited;
-    heap_init(&W, max_ef + 8, 1);  /* max-heap */
-    heap_init(&C, max_ef + 8, 0);  /* min-heap */
+    if (hcap_i <= (int)(sizeof w_stack / sizeof w_stack[0])) {
+        heap_init_with_buffer(&W, w_stack, hcap_i, 1);
+        heap_init_with_buffer(&C, c_stack, hcap_i, 0);
+    } else {
+        heap_init(&W, hcap_i, 1);
+        heap_init(&C, hcap_i, 0);
+    }
     epochset_init(&visited, idx->node_cap + 8);
 
     int ep = idx->ep_node;
@@ -315,9 +326,18 @@ int hnsw_insert(HNSWIndex *idx, uint64_t id, const char *label, const float *vec
             /* Prune if over capacity */
             int max_conn = (lc == 0) ? idx->M_max0 : idx->M;
             if (nbn->neighbor_cnt[lc] > max_conn) {
-                /* Simple pruning: rebuild neighbor list keeping M nearest */
+                /* Simple pruning: rebuild neighbor list keeping M nearest.
+                 * tmp_h is sized to (n_existing_neighbors + 2) which is
+                 * always ≤ M_max0 + a few — well within the 256-slot stack
+                 * buffer. */
+                int       tcap = nbn->neighbor_cnt[lc] + 2;
+                HeapItem  tmp_stack[256];
                 Heap tmp_h;
-                heap_init(&tmp_h, nbn->neighbor_cnt[lc] + 2, 1);
+                if (tcap <= (int)(sizeof tmp_stack / sizeof tmp_stack[0])) {
+                    heap_init_with_buffer(&tmp_h, tmp_stack, tcap, 1);
+                } else {
+                    heap_init(&tmp_h, tcap, 1);
+                }
                 for (int j = 0; j < nbn->neighbor_cnt[lc]; j++) {
                     int nb2 = nbn->neighbors[lc][j];
                     float d = node_dist(idx, nb, nb2);
@@ -376,10 +396,27 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
     if (ef < k) ef = k;
 
     int max_ef = ef + 8;
+    int hcap   = max_ef + 8;
+
+    /* Stack-allocate the typical heap buffers and result-collection arrays.
+     * Up to ef ≈ 248 and total ≈ 256 we never touch the heap allocator on the
+     * search hot path.  heap_push's grow-on-overflow path transparently
+     * promotes to a malloc'd buffer if the workload exceeds these caps. */
+    HeapItem  w_stack[256];
+    HeapItem  c_stack[256];
+    float     dist_stack[256];
+    int       node_stack[256];
+
     Heap   W, C;
     EpochSet visited;
-    heap_init(&W, max_ef + 8, 1);
-    heap_init(&C, max_ef + 8, 0);
+
+    if (hcap <= (int)(sizeof w_stack / sizeof w_stack[0])) {
+        heap_init_with_buffer(&W, w_stack, hcap, 1);
+        heap_init_with_buffer(&C, c_stack, hcap, 0);
+    } else {
+        heap_init(&W, hcap, 1);
+        heap_init(&C, hcap, 0);
+    }
     epochset_init(&visited, idx->n_nodes + 8);
 
     int ep = idx->ep_node;
@@ -395,9 +432,10 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
     /* Collect results (W is max-heap; drain to get ascending order). */
     int   total = W.size;
     int   cnt   = 0;
-    float *dist_buf = NULL;
-    int   *node_buf = NULL;
-    if (total > 0) {
+    float *dist_buf = dist_stack;
+    int   *node_buf = node_stack;
+    int    bufs_owned = 0;
+    if (total > (int)(sizeof dist_stack / sizeof dist_stack[0])) {
         dist_buf = (float *)malloc(sizeof(float) * (size_t)total);
         node_buf = (int   *)malloc(sizeof(int)   * (size_t)total);
         if (!dist_buf || !node_buf) {
@@ -405,6 +443,9 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
             heap_free(&W); heap_free(&C); epochset_free(&visited);
             return 0;
         }
+        bufs_owned = 1;
+    }
+    if (total > 0) {
         while (W.size > 0) {
             HeapItem it = heap_pop(&W);
             dist_buf[W.size] = it.key;
@@ -421,7 +462,7 @@ int hnsw_search(HNSWIndex *idx, const float *query, int k, int ef,
             cnt++;
         }
     }
-    free(dist_buf); free(node_buf);
+    if (bufs_owned) { free(dist_buf); free(node_buf); }
     heap_free(&W); heap_free(&C);
     epochset_free(&visited);
     return cnt;

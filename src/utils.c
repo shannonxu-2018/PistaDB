@@ -22,14 +22,25 @@ int heap_init(Heap *h, int capacity, int is_max) {
     h->size   = 0;
     h->cap    = capacity;
     h->is_max = is_max;
+    h->owned  = 1;
+    return PISTADB_OK;
+}
+
+int heap_init_with_buffer(Heap *h, HeapItem *buf, int capacity, int is_max) {
+    h->data   = buf;
+    h->size   = 0;
+    h->cap    = capacity;
+    h->is_max = is_max;
+    h->owned  = 0;          /* caller owns buf — heap_push will copy on grow */
     return PISTADB_OK;
 }
 
 void heap_free(Heap *h) {
-    free(h->data);
-    h->data = NULL;
-    h->size = 0;
-    h->cap  = 0;
+    if (h->owned) free(h->data);
+    h->data  = NULL;
+    h->size  = 0;
+    h->cap   = 0;
+    h->owned = 0;
 }
 
 void heap_clear(Heap *h) { h->size = 0; }
@@ -72,8 +83,17 @@ static void sift_down(Heap *h, int idx) {
 int heap_push(Heap *h, float key, uint64_t id) {
     if (h->size == h->cap) {
         int newcap = h->cap * 2 + 8;
-        HeapItem *nd = (HeapItem *)realloc(h->data, sizeof(HeapItem) * (size_t)newcap);
-        if (!nd) return PISTADB_ENOMEM;
+        HeapItem *nd;
+        if (h->owned) {
+            nd = (HeapItem *)realloc(h->data, sizeof(HeapItem) * (size_t)newcap);
+            if (!nd) return PISTADB_ENOMEM;
+        } else {
+            /* Caller's buffer overflowed — promote to a heap-allocated copy. */
+            nd = (HeapItem *)malloc(sizeof(HeapItem) * (size_t)newcap);
+            if (!nd) return PISTADB_ENOMEM;
+            memcpy(nd, h->data, sizeof(HeapItem) * (size_t)h->size);
+            h->owned = 1;
+        }
         h->data = nd;
         h->cap  = newcap;
     }
