@@ -226,28 +226,48 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
                PistaDBResult *results) {
     if (!idx->trained) return 0;
 
-    /* Find nprobe nearest centroids */
-    float *c_dists = (float *)malloc(sizeof(float) * (size_t)idx->nlist);
-    int   *c_order = (int   *)malloc(sizeof(int)   * (size_t)idx->nlist);
-    if (!c_dists || !c_order) { free(c_dists); free(c_order); return 0; }
+    /* Find nprobe nearest centroids via a size-nprobe max-heap (O(nlist log
+     * nprobe) vs the previous O(nprobe × nlist) partial sort).  Heap state
+     * lives on the stack for typical nprobe ≤ 248. */
+    int n_probe = idx->nprobe < idx->nlist ? idx->nprobe : idx->nlist;
+    if (n_probe <= 0) return 0;
 
+    HeapItem  cheap_stack[256];
+    Heap      cheap;
+    if (n_probe + 1 <= (int)(sizeof cheap_stack / sizeof cheap_stack[0])) {
+        heap_init_with_buffer(&cheap, cheap_stack, n_probe + 1, 1); /* max-heap */
+    } else {
+        heap_init(&cheap, n_probe + 1, 1);
+    }
     for (int c = 0; c < idx->nlist; c++) {
-        c_dists[c] = dist_l2sq(query, idx->centroids + (size_t)c * idx->dim, idx->dim);
-        c_order[c] = c;
+        float d = dist_l2sq(query,
+                            idx->centroids + (size_t)c * idx->dim, idx->dim);
+        if (cheap.size < n_probe) {
+            heap_push(&cheap, d, (uint64_t)c);
+        } else if (d < heap_top(&cheap).key) {
+            heap_pop(&cheap);
+            heap_push(&cheap, d, (uint64_t)c);
+        }
     }
-    /* Partial sort: find nprobe smallest */
-    for (int i = 0; i < idx->nprobe && i < idx->nlist; i++) {
-        int best = i;
-        for (int j = i + 1; j < idx->nlist; j++)
-            if (c_dists[c_order[j]] < c_dists[c_order[best]]) best = j;
-        int tmp = c_order[i]; c_order[i] = c_order[best]; c_order[best] = tmp;
+    int   c_order_stack[256];
+    int  *c_order = c_order_stack;
+    int   c_order_owned = 0;
+    if (n_probe > (int)(sizeof c_order_stack / sizeof c_order_stack[0])) {
+        c_order = (int *)malloc(sizeof(int) * (size_t)n_probe);
+        if (!c_order) { heap_free(&cheap); return 0; }
+        c_order_owned = 1;
     }
+    /* Drain heap; relative order of selected centroids does not matter for
+     * the inverted-list scan that follows. */
+    int n_selected = cheap.size;
+    for (int i = 0; i < n_selected; i++) c_order[i] = (int)heap_pop(&cheap).id;
+    heap_free(&cheap);
 
     /* Scan selected centroids and collect k-best.  We store the internal
      * slot in heap.id so the post-processing step below can look up id and
      * label directly without an O(n_vecs) linear scan per result. */
     Heap heap; heap_init(&heap, k + 4, 1);  /* max-heap */
-    for (int pi = 0; pi < idx->nprobe && pi < idx->nlist; pi++) {
+    for (int pi = 0; pi < n_selected; pi++) {
         int c = c_order[pi];
         for (int j = 0; j < idx->list_sizes[c]; j++) {
             IVFPosting p = idx->lists[c][j];
@@ -261,7 +281,7 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
             }
         }
     }
-    free(c_dists); free(c_order);
+    if (c_order_owned) free(c_order);
 
     int cnt = heap.size;
     if (cnt == 0) { heap_free(&heap); return 0; }
