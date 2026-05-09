@@ -101,55 +101,15 @@ int linear_update(LinearIndex *idx, uint64_t id, const float *vec) {
     return PISTADB_OK;
 }
 
-/* Insertion sort into a fixed-size result buffer (max-heap by distance). */
-static void result_insert(PistaDBResult *res, int *cnt, int k,
-                           uint64_t id, float dist, const char *label) {
-    if (*cnt < k) {
-        res[*cnt].id       = id;
-        res[*cnt].distance = dist;
-        if (label) strncpy(res[*cnt].label, label, 255);
-        else        res[*cnt].label[0] = '\0';
-        res[*cnt].label[255] = '\0';
-        (*cnt)++;
-        /* bubble-up largest to front for easy eviction */
-        for (int i = *cnt - 1; i > 0 && res[i].distance > res[i-1].distance; i--) {
-            PistaDBResult tmp = res[i]; res[i] = res[i-1]; res[i-1] = tmp;
-        }
-    } else if (dist < res[0].distance) {
-        res[0].id       = id;
-        res[0].distance = dist;
-        if (label) strncpy(res[0].label, label, 255);
-        else        res[0].label[0] = '\0';
-        res[0].label[255] = '\0';
-        /* sift down */
-        int pos = 0;
-        for (;;) {
-            int worst = pos;
-            if (pos + 1 < *cnt && res[pos+1].distance > res[worst].distance) worst = pos + 1;
-            if (worst == pos) break;
-            PistaDBResult tmp = res[pos]; res[pos] = res[worst]; res[worst] = tmp;
-            pos = worst;
-        }
-    }
-}
-
-/* qsort comparator: ascending by distance. */
-static int linear_cmp_result(const void *a, const void *b) {
-    float da = ((const PistaDBResult *)a)->distance;
-    float db = ((const PistaDBResult *)b)->distance;
-    return (da > db) - (da < db);
-}
-
 int linear_search(const LinearIndex *idx, const float *query, int k,
                   PistaDBResult *results) {
-    int cnt = 0;
+    /* Use max-heap (same as HNSW/IVF/LSH) — avoids copying 256-byte label
+     * arrays during heap maintenance.  Labels are only materialised at the
+     * end when draining the heap in ascending distance order. */
+    Heap heap;
+    if (heap_init(&heap, k + 4, 1) != PISTADB_OK) return 0;
 
     if (idx->batch_fn) {
-        /* Batched path: gather up to 256 live entries' vector pointers, then
-         * call the batch dist kernel once.  Removes the dispatch / fn-pointer
-         * load from the inner loop and lets the kernel prefetch the next
-         * candidate while computing the current one.  Bit-identical to the
-         * per-pair fallback below. */
         enum { BATCH = 256 };
         const float *ptrs [BATCH];
         int          slots[BATCH];
@@ -169,24 +129,30 @@ int linear_search(const LinearIndex *idx, const float *query, int k,
             if (n == 0) continue;
             idx->batch_fn(query, ptrs, (size_t)n, idx->dim, dbuf);
             for (int j = 0; j < n; j++) {
-                int s = slots[j];
-                result_insert(results, &cnt, k, idx->ids[s], dbuf[j],
-                              VS_LABEL(&idx->vs, s));
+                float d = dbuf[j];
+                int   s = slots[j];
+                if (heap.size < k) heap_push(&heap, d, (uint64_t)s);
+                else if (d < heap_top(&heap).key) { heap_pop(&heap); heap_push(&heap, d, (uint64_t)s); }
             }
         }
     } else {
-        /* Fallback: per-pair dispatch (used when batch_fn was not wired). */
         for (int i = 0; i < idx->size; i++) {
             if (idx->deleted[i]) continue;
             float d = idx->dist_fn(query, VS_VEC(&idx->vs, i), idx->dim);
-            result_insert(results, &cnt, k, idx->ids[i], d,
-                          VS_LABEL(&idx->vs, i));
+            if (heap.size < k) heap_push(&heap, d, (uint64_t)i);
+            else if (d < heap_top(&heap).key) { heap_pop(&heap); heap_push(&heap, d, (uint64_t)i); }
         }
     }
-    /* result_insert maintains a max-heap-by-distance shape, so we still need
-     * a final ascending sort.  Use qsort (O(k log k)) instead of the prior
-     * O(k²) bubble sort. */
-    if (cnt > 1) qsort(results, (size_t)cnt, sizeof(PistaDBResult), linear_cmp_result);
+
+    int cnt = heap.size;
+    for (int i = cnt - 1; i >= 0; i--) {
+        HeapItem it = heap_pop(&heap);
+        int s = (int)it.id;
+        results[i].id       = idx->ids[s];
+        results[i].distance = it.key;
+        memcpy(results[i].label, VS_LABEL(&idx->vs, s), 256);
+    }
+    heap_free(&heap);
     return cnt;
 }
 

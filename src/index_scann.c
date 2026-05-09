@@ -497,21 +497,30 @@ int scann_search(const ScaNNIndex *idx, const float *query, int k,
     const int nprobe   = (idx->nprobe < nlist) ? idx->nprobe : nlist;
     const int rerank_k = (idx->rerank_k > k)   ? idx->rerank_k : k;
 
-    /* ── Identify the nprobe nearest coarse centroids ─────────────────── */
-    float *c_dists = (float *)malloc(sizeof(float) * (size_t)nlist);
-    int   *c_probe = (int   *)malloc(sizeof(int)   * (size_t)nlist);
-    if (!c_dists || !c_probe) { free(c_dists); free(c_probe); return 0; }
+    /* ── Identify the nprobe nearest coarse centroids via size-nprobe
+     * max-heap (O(nlist log nprobe) vs the previous O(nprobe × nlist)
+     * partial sort). ──────────────────────────────────────────────── */
+    HeapItem  cheap_stack[256];
+    Heap      cheap;
+    if (nprobe + 1 <= (int)(sizeof cheap_stack / sizeof cheap_stack[0]))
+        heap_init_with_buffer(&cheap, cheap_stack, nprobe + 1, 1); /* max-heap */
+    else
+        heap_init(&cheap, nprobe + 1, 1);
     for (int c = 0; c < nlist; c++) {
-        c_dists[c] = dist_l2sq(query, idx->centroids + (size_t)c * dim, dim);
-        c_probe[c] = c;
+        float d = dist_l2sq(query, idx->centroids + (size_t)c * dim, dim);
+        if (cheap.size < nprobe)
+            heap_push(&cheap, d, (uint64_t)c);
+        else if (d < heap_top(&cheap).key) {
+            heap_pop(&cheap);
+            heap_push(&cheap, d, (uint64_t)c);
+        }
     }
-    for (int i = 0; i < nprobe; i++) {
-        int best = i;
-        for (int j = i + 1; j < nlist; j++)
-            if (c_dists[c_probe[j]] < c_dists[c_probe[best]]) best = j;
-        int t = c_probe[i]; c_probe[i] = c_probe[best]; c_probe[best] = t;
-    }
-    free(c_dists);
+    int n_selected = cheap.size;
+    int *c_probe = (int *)malloc(sizeof(int) * (size_t)n_selected);
+    if (!c_probe) { heap_free(&cheap); return 0; }
+    for (int i = 0; i < n_selected; i++)
+        c_probe[i] = (int)heap_pop(&cheap).id;
+    heap_free(&cheap);
 
     /* Sorted (id → slot) over live vectors so deletion checks are O(log N). */
     ScaNNIdSlot *idmap   = NULL;
@@ -560,7 +569,7 @@ int scann_search(const ScaNNIndex *idx, const float *query, int k,
     }
 
     const int esz = entry_sz(idx);
-    for (int pi = 0; pi < nprobe; pi++) {
+    for (int pi = 0; pi < n_selected; pi++) {
         int c = c_probe[pi];
         const float *cc = idx->centroids + (size_t)c * dim;
 
@@ -626,9 +635,16 @@ int scann_search(const ScaNNIndex *idx, const float *query, int k,
 
     int cnt = final_heap.size;
     if (cnt == 0) { heap_free(&final_heap); return 0; }
-    float *ds = (float *)malloc(sizeof(float) * (size_t)cnt);
-    int   *ss = (int   *)malloc(sizeof(int)   * (size_t)cnt);
-    if (!ds || !ss) { free(ds); free(ss); heap_free(&final_heap); return 0; }
+    float ds_stack[256], *ds;
+    int   ss_stack[256], *ss;
+    int   ds_heap = 0, ss_heap = 0;
+    if (cnt <= 256) { ds = ds_stack; ss = ss_stack; }
+    else {
+        ds = (float *)malloc(sizeof(float) * (size_t)cnt);
+        ss = (int   *)malloc(sizeof(int)   * (size_t)cnt);
+        if (!ds || !ss) { free(ds); free(ss); heap_free(&final_heap); return 0; }
+        ds_heap = 1; ss_heap = 1;
+    }
     for (int i = cnt - 1; i >= 0; i--) {
         HeapItem it = heap_pop(&final_heap);
         ds[i] = it.key; ss[i] = (int)it.id;
@@ -642,7 +658,8 @@ int scann_search(const ScaNNIndex *idx, const float *query, int k,
         strncpy(results[i].label, VS_LABEL(&idx->vs, s), 255);
         results[i].label[255] = '\0';
     }
-    free(ds); free(ss);
+    if (ds_heap) free(ds);
+    if (ss_heap) free(ss);
     return cnt;
 }
 

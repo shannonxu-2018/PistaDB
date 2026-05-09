@@ -255,6 +255,7 @@ int lsh_search(const LSHIndex *idx, const float *query, int k,
         const float *ptrs [BATCH];
         int          slots[BATCH];
         float        dbuf [BATCH];
+        BatchDistFn batch_fn = idx->batch_fn;
         int ci = 0;
         while (ci < n_cands) {
             int n = 0;
@@ -266,8 +267,8 @@ int lsh_search(const LSHIndex *idx, const float *query, int k,
                 n++;
             }
             if (n == 0) continue;
-            if (idx->batch_fn) {
-                idx->batch_fn(query, ptrs, (size_t)n, idx->dim, dbuf);
+            if (batch_fn) {
+                batch_fn(query, ptrs, (size_t)n, idx->dim, dbuf);
             } else {
                 for (int t = 0; t < n; t++)
                     dbuf[t] = idx->dist_fn(query, ptrs[t], idx->dim);
@@ -288,8 +289,14 @@ int lsh_search(const LSHIndex *idx, const float *query, int k,
 
     /* Drain max-heap in ascending order, fill results directly from slot. */
     int total = heap.size;
-    HeapItem *items = (HeapItem *)malloc(sizeof(HeapItem) * (size_t)(total + 1));
-    if (!items) { heap_free(&heap); return 0; }
+    HeapItem items_stack[256], *items;
+    int items_heap = 0;
+    if (total <= 256) { items = items_stack; }
+    else {
+        items = (HeapItem *)malloc(sizeof(HeapItem) * (size_t)total);
+        if (!items) { heap_free(&heap); return 0; }
+        items_heap = 1;
+    }
     while (heap.size > 0) {
         HeapItem it = heap_pop(&heap);
         items[heap.size] = it;   /* after pop, heap.size is one less → ascending fill */
@@ -301,7 +308,7 @@ int lsh_search(const LSHIndex *idx, const float *query, int k,
         strncpy(results[i].label, VS_LABEL(&idx->vs, s), 255);
         results[i].label[255] = '\0';
     }
-    free(items);
+    if (items_heap) free(items);
     heap_free(&heap);
     return total;
 }

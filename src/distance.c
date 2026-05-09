@@ -265,42 +265,34 @@ static void simd_init(void) { pthread_once(&g_simd_once, simd_detect); }
 /* ── Public API (thin dispatch wrappers) ─────────────────────────────────── */
 
 float vec_dot(const float *a, const float *b, int dim) {
-    simd_init();
     return active_vec_dot(a, b, dim);
 }
 
 float vec_norm(const float *a, int dim) {
-    simd_init();
     return active_vec_norm(a, dim);
 }
 
 float dist_l2sq(const float *a, const float *b, int dim) {
-    simd_init();
     return active_dist_l2sq(a, b, dim);
 }
 
 float dist_l2(const float *a, const float *b, int dim) {
-    simd_init();
     return active_dist_l2(a, b, dim);
 }
 
 float dist_cosine(const float *a, const float *b, int dim) {
-    simd_init();
     return active_dist_cosine(a, b, dim);
 }
 
 float dist_ip(const float *a, const float *b, int dim) {
-    simd_init();
     return active_dist_ip(a, b, dim);
 }
 
 float dist_l1(const float *a, const float *b, int dim) {
-    simd_init();
     return active_dist_l1(a, b, dim);
 }
 
 float dist_hamming(const float *a, const float *b, int dim) {
-    simd_init();
     return active_dist_hamming(a, b, dim);
 }
 
@@ -317,7 +309,6 @@ float dist_hamming(const float *a, const float *b, int dim) {
 
 #define BATCH_BODY(FN_PTR)                                                  \
     do {                                                                    \
-        simd_init();                                                        \
         DistFn fn = (FN_PTR);                                               \
         for (size_t i = 0; i < n; i++) {                                    \
             if (i + 1 < n) PISTA_PREFETCH(vecs[i + 1]);                     \

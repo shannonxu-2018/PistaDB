@@ -55,6 +55,7 @@
 typedef struct CacheEntry {
     uint64_t          hash;       /* FNV-1a 64-bit hash of text              */
     char             *text;       /* heap-allocated, null-terminated          */
+    uint32_t          text_len;   /* strlen(text)+1, cached to avoid O(N) save */
     float            *vec;        /* heap-allocated float[dim]                */
     struct CacheEntry *hash_next; /* separate-chaining within bucket          */
     struct CacheEntry *lru_prev;  /* doubly-linked LRU list: prev (toward LRU)*/
@@ -196,8 +197,9 @@ static CacheEntry *entry_alloc(uint64_t hash, const char *text,
     if (!e) return NULL;
 
     size_t tlen = strlen(text) + 1;
-    e->text = (char *)malloc(tlen);
-    e->vec  = (float *)malloc((size_t)dim * sizeof(float));
+    e->text     = (char *)malloc(tlen);
+    e->text_len = (uint32_t)tlen;
+    e->vec      = (float *)malloc((size_t)dim * sizeof(float));
     if (!e->text || !e->vec) {
         free(e->text); free(e->vec); free(e);
         return NULL;
@@ -381,6 +383,7 @@ static void cache_load(PistaDBCache *c, const char *path)
             e->text = (char *)malloc(tlen);
             if (!e->text) { free(e); free(vec); break; }
             memcpy(e->text, tbuf, tlen);
+            e->text_len = (uint32_t)tlen;
             e->vec  = vec;
             e->hash = hash;
 
@@ -459,14 +462,13 @@ int pistadb_cache_save(PistaDBCache *c)
     static const uint8_t zeros[18] = {0};
     write_bytes(f, zeros, 18, &ok);
 
-    /* ── Entries: walk from tail (LRU) toward head (MRU) via lru_prev.
-     * Storing LRU-first means a sequential reload via lru_push_head()
+    /* ── Entries: walk from head (MRU) toward tail (LRU) via lru_next.
+     * Storing MRU-first means a sequential reload via lru_push_head()
      * recreates the exact same MRU ordering. */
     size_t vbytes = (size_t)c->dim * sizeof(float);
-    for (CacheEntry *e = c->lru_tail; e && ok; e = e->lru_prev) {
-        size_t tlen = strlen(e->text) + 1;
-        write_u32_le(f, (uint32_t)tlen, &ok);
-        write_bytes(f, e->text, tlen,   &ok);
+    for (CacheEntry *e = c->lru_head; e && ok; e = e->lru_next) {
+        write_u32_le(f, e->text_len, &ok);
+        write_bytes(f, e->text, (size_t)e->text_len, &ok);
         write_bytes(f, e->vec,  vbytes, &ok);
     }
 

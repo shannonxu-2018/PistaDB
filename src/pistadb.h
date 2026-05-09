@@ -112,6 +112,9 @@ const char *pistadb_last_error(PistaDB *db);
 /* ── Version ─────────────────────────────────────────────────────────────── */
 const char *pistadb_version(void);  /* e.g. "1.0.0" */
 
+/* ── Internal helpers (not part of the public API) ────────────────────────── */
+void pistadb_txn_undo_n_total(PistaDB *db, int delta);
+
 #ifdef __cplusplus
 }
 #endif

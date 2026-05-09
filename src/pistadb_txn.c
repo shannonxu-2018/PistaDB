@@ -291,6 +291,7 @@ int pistadb_txn_commit(PistaDBTxn *txn)
                     case PISTADB_TXN_INSERT:
                         /* Undo: delete the just-inserted vector. */
                         ur = pistadb_delete(db, prev->id);
+                        if (ur == PISTADB_OK) pistadb_txn_undo_n_total(db, -1);
                         break;
                     case PISTADB_TXN_DELETE:
                         if (prev->has_undo) {
@@ -298,6 +299,9 @@ int pistadb_txn_commit(PistaDBTxn *txn)
                                                ? prev->undo_label : NULL;
                             ur = pistadb_insert(db, prev->id, ulbl,
                                                 prev->undo_vec);
+                            /* Undo insert's n_total increment — the original
+                             * delete didn't decrement n_total. */
+                            if (ur == PISTADB_OK) pistadb_txn_undo_n_total(db, -1);
                         } else {
                             ur = PISTADB_ERR;
                             partial = 1;

@@ -17,6 +17,7 @@
 #include "pistadb_types.h"
 #include "vec_store.h"
 #include "distance.h"
+#include "utils.h"
 #include <stdint.h>
 
 /* Maximum number of layers.  log₂(2^31) = 31, so 48 is very safe. */
@@ -54,8 +55,8 @@ typedef struct {
     int       ep_node;         /* index into nodes[], -1 if empty   */
     int       max_layer;
 
-    /* RNG for level generation */
-    /* (use global PCG seeded once) */
+    /* Per-instance RNG for level generation (thread-safe w/ external lock). */
+    PCG        rng;
 } HNSWIndex;
 
 int  hnsw_create(HNSWIndex *idx, int dim, DistFn dist_fn,

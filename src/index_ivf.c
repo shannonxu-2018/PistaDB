@@ -288,6 +288,7 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
         const float *ptrs [BATCH];
         int          slots[BATCH];
         float        dbuf [BATCH];
+        BatchDistFn batch_fn = idx->batch_fn;
         for (int pi = 0; pi < n_selected; pi++) {
             int c    = c_order[pi];
             int lsz  = idx->list_sizes[c];
@@ -302,8 +303,8 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
                     n++;
                 }
                 if (n == 0) continue;
-                if (idx->batch_fn) {
-                    idx->batch_fn(query, ptrs, (size_t)n, idx->dim, dbuf);
+                if (batch_fn) {
+                    batch_fn(query, ptrs, (size_t)n, idx->dim, dbuf);
                 } else {
                     for (int t = 0; t < n; t++)
                         dbuf[t] = idx->dist_fn(query, ptrs[t], idx->dim);
@@ -325,10 +326,17 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
 
     int cnt = heap.size;
     if (cnt == 0) { heap_free(&heap); return 0; }
-    /* Drain max-heap to obtain ascending distance order. */
-    float *ds = (float *)malloc(sizeof(float) * (size_t)cnt);
-    int   *ss = (int   *)malloc(sizeof(int)   * (size_t)cnt);
-    if (!ds || !ss) { free(ds); free(ss); heap_free(&heap); return 0; }
+    /* Drain max-heap to obtain ascending distance order — stack for typical k. */
+    float ds_stack[256], *ds;
+    int   ss_stack[256], *ss;
+    int   ds_heap = 0, ss_heap = 0;
+    if (cnt <= 256) { ds = ds_stack; ss = ss_stack; }
+    else {
+        ds = (float *)malloc(sizeof(float) * (size_t)cnt);
+        ss = (int   *)malloc(sizeof(int)   * (size_t)cnt);
+        if (!ds || !ss) { free(ds); free(ss); heap_free(&heap); return 0; }
+        ds_heap = 1; ss_heap = 1;
+    }
     for (int i = cnt - 1; i >= 0; i--) {
         HeapItem it = heap_pop(&heap);
         ds[i] = it.key; ss[i] = (int)it.id;
@@ -340,7 +348,8 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
         strncpy(results[i].label, VS_LABEL(&idx->vs, s), 255);
         results[i].label[255] = '\0';
     }
-    free(ds); free(ss);
+    if (ds_heap) free(ds);
+    if (ss_heap) free(ss);
     heap_free(&heap);
     return cnt;
 }

@@ -77,7 +77,7 @@ typedef struct {
     /* LSH */
     int   lsh_L;                 /* number of hash tables     (default 10)    */
     int   lsh_K;                 /* hash functions per table  (default 8)     */
-    float lsh_w;                 /* bucket width (E2LSH)      (default 4.0)   */
+    float lsh_w;                 /* bucket width (E2LSH)      (default 10.0)  */
 
     /* ScaNN (Anisotropic Vector Quantization) */
     int   scann_nlist;           /* coarse IVF partitions     (default 128)   */

@@ -339,20 +339,31 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
                  PistaDBResult *results) {
     if (!idx->trained || k <= 0) return 0;
 
-    /* Find nprobe nearest coarse centroids. */
-    float *c_dists = (float *)malloc(sizeof(float) * (size_t)idx->nlist);
-    int   *c_order = (int   *)malloc(sizeof(int)   * (size_t)idx->nlist);
-    if (!c_dists || !c_order) { free(c_dists); free(c_order); return 0; }
+    /* Find nprobe nearest coarse centroids via size-nprobe max-heap
+     * (O(nlist log nprobe) vs the previous O(nprobe × nlist) partial sort). */
+    int n_probe = idx->nprobe < idx->nlist ? idx->nprobe : idx->nlist;
+    if (n_probe <= 0) return 0;
+    HeapItem  cheap_stack[256];
+    Heap      cheap;
+    if (n_probe + 1 <= (int)(sizeof cheap_stack / sizeof cheap_stack[0]))
+        heap_init_with_buffer(&cheap, cheap_stack, n_probe + 1, 1); /* max-heap */
+    else
+        heap_init(&cheap, n_probe + 1, 1);
     for (int c = 0; c < idx->nlist; c++) {
-        c_dists[c] = dist_l2sq(query, idx->coarse_centroids + (size_t)c*idx->dim, idx->dim);
-        c_order[c] = c;
+        float d = dist_l2sq(query, idx->coarse_centroids + (size_t)c*idx->dim, idx->dim);
+        if (cheap.size < n_probe)
+            heap_push(&cheap, d, (uint64_t)c);
+        else if (d < heap_top(&cheap).key) {
+            heap_pop(&cheap);
+            heap_push(&cheap, d, (uint64_t)c);
+        }
     }
-    for (int i = 0; i < idx->nprobe; i++) {
-        int best = i;
-        for (int j = i+1; j < idx->nlist; j++)
-            if (c_dists[c_order[j]] < c_dists[c_order[best]]) best = j;
-        int t = c_order[i]; c_order[i] = c_order[best]; c_order[best] = t;
-    }
+    int *c_order = (int *)malloc(sizeof(int) * (size_t)n_probe);
+    if (!c_order) { heap_free(&cheap); return 0; }
+    int n_selected = cheap.size;
+    for (int i = 0; i < n_selected; i++)
+        c_order[i] = (int)heap_pop(&cheap).id;
+    heap_free(&cheap);
 
     /* Build a one-time sorted (id → slot) table over live vectors so the
      * deletion check inside the hot loop is O(log n_vecs) instead of O(n_vecs)
@@ -361,7 +372,7 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
     int     idmap_n = 0;
     if (idx->n_vecs > 0) {
         idmap = (IdSlot *)malloc(sizeof(IdSlot) * (size_t)idx->n_vecs);
-        if (!idmap) { free(c_dists); free(c_order); return 0; }
+        if (!idmap) { free(c_order); return 0; }
         for (int s = 0; s < idx->n_vecs; s++) {
             if (idx->all_deleted[s]) continue;
             idmap[idmap_n].id   = idx->all_ids[s];
@@ -374,7 +385,7 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
     float *lut  = (float *)malloc(sizeof(float) * (size_t)(idx->M * idx->K_sub));
     float *qres = (float *)malloc(sizeof(float) * (size_t)idx->dim);
     if (!lut || !qres) {
-        free(c_dists); free(c_order); free(lut); free(qres); free(idmap);
+        free(c_order); free(lut); free(qres); free(idmap);
         return 0;
     }
 
@@ -387,7 +398,7 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
     if (idx->n_vecs > 0) {
         seen_slot = (uint8_t *)calloc((size_t)idx->n_vecs, 1);
         if (!seen_slot) {
-            free(c_dists); free(c_order); free(lut); free(qres); free(idmap);
+            free(c_order); free(lut); free(qres); free(idmap);
             return 0;
         }
     }
@@ -395,12 +406,12 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
     /* Heap stores slot in id field so post-processing has O(1) label lookup. */
     Heap heap;
     if (heap_init(&heap, k + 4, 1) != PISTADB_OK) {
-        free(c_dists); free(c_order); free(lut); free(qres); free(idmap); free(seen_slot);
+        free(c_order); free(lut); free(qres); free(idmap); free(seen_slot);
         return 0;
     }
 
     int entry_size = 8 + idx->M;
-    for (int pi = 0; pi < idx->nprobe && pi < idx->nlist; pi++) {
+    for (int pi = 0; pi < n_selected; pi++) {
         int c = c_order[pi];
         const float *cc = idx->coarse_centroids + (size_t)c * idx->dim;
         for (int d = 0; d < idx->dim; d++) qres[d] = query[d] - cc[d];
@@ -421,13 +432,20 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
             }
         }
     }
-    free(c_dists); free(c_order); free(lut); free(qres); free(idmap); free(seen_slot);
+    free(c_order); free(lut); free(qres); free(idmap); free(seen_slot);
 
     int cnt = heap.size;
     if (cnt == 0) { heap_free(&heap); return 0; }
-    float *ds = (float *)malloc(sizeof(float) * (size_t)cnt);
-    int   *ss = (int   *)malloc(sizeof(int)   * (size_t)cnt);
-    if (!ds || !ss) { free(ds); free(ss); heap_free(&heap); return 0; }
+    float ds_stack[256], *ds;
+    int   ss_stack[256], *ss;
+    int   ds_heap = 0, ss_heap = 0;
+    if (cnt <= 256) { ds = ds_stack; ss = ss_stack; }
+    else {
+        ds = (float *)malloc(sizeof(float) * (size_t)cnt);
+        ss = (int   *)malloc(sizeof(int)   * (size_t)cnt);
+        if (!ds || !ss) { free(ds); free(ss); heap_free(&heap); return 0; }
+        ds_heap = 1; ss_heap = 1;
+    }
     for (int i = cnt - 1; i >= 0; i--) {
         HeapItem it = heap_pop(&heap);
         ds[i] = it.key; ss[i] = (int)it.id;
@@ -439,7 +457,9 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
         strncpy(results[i].label, VS_LABEL(&idx->vs, s), 255);
         results[i].label[255] = '\0';
     }
-    free(ds); free(ss); heap_free(&heap);
+    if (ds_heap) free(ds);
+    if (ss_heap) free(ss);
+    heap_free(&heap);
     return cnt;
 }
 

@@ -58,8 +58,12 @@ struct PistaDB {
 
 static void set_err(PistaDB *db, int code, const char *msg) {
     (void)code;
-    if (msg) strncpy(db->last_err, msg, sizeof(db->last_err) - 1);
-    else db->last_err[0] = '\0';
+    if (msg) {
+        strncpy(db->last_err, msg, sizeof(db->last_err) - 1);
+        db->last_err[sizeof(db->last_err) - 1] = '\0';
+    } else {
+        db->last_err[0] = '\0';
+    }
 }
 
 static const char *err_str(int code) {
@@ -296,6 +300,7 @@ PistaDB *pistadb_open(const char *path, int dim,
     if (!db) return NULL;
 
     strncpy(db->path, path, sizeof(db->path) - 1);
+    db->path[sizeof(db->path) - 1] = '\0';
     db->dim        = dim;
     db->metric     = metric;
     db->index_type = index;
@@ -310,7 +315,11 @@ PistaDB *pistadb_open(const char *path, int dim,
         fclose(check);
         int r = load_from_file(db);
         if (r == PISTADB_OK) return db;
-        /* Fall through: create fresh (file may be new/empty) */
+        /* File exists but load failed — refuse to create a fresh database
+         * over it, as that would destroy the original on a subsequent save(). */
+        set_err(db, r, err_str(r));
+        free(db);
+        return NULL;
     }
 
     /* Create fresh index */
@@ -429,6 +438,11 @@ int pistadb_delete(PistaDB *db, uint64_t id) {
     if (r == PISTADB_OK) db->n_active--;
     else set_err(db, r, err_str(r));
     return r;
+}
+
+/* Used by transaction rollback to correct n_total after undo operations. */
+void pistadb_txn_undo_n_total(PistaDB *db, int delta) {
+    db->n_total = (uint64_t)((int64_t)db->n_total + delta);
 }
 
 int pistadb_update(PistaDB *db, uint64_t id, const float *vec) {

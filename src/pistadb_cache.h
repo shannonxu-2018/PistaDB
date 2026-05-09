@@ -36,7 +36,7 @@
  *    evictions[8]    uint64  cumulative LRU evictions
  *    reserved[18]    zeros
  *
- *  [Entries – repeated n_entries times, stored LRU-first]
+ *  [Entries – repeated n_entries times, stored MRU-first]
  *    text_len[4]     uint32  byte length of text (including '\0')
  *    text[text_len]  char[]  null-terminated string
  *    vec[dim×4]      float[] embedding vector  (native byte order)

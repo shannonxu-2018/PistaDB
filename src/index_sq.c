@@ -244,75 +244,38 @@ int sq_update(SQIndex *idx, uint64_t id, const float *vec) {
 
 /* ── Search ─────────────────────────────────────────────────────────────── */
 
-static void sq_result_insert(PistaDBResult *res, int *cnt, int k,
-                              uint64_t id, float dist, const char *label) {
-    if (*cnt < k) {
-        res[*cnt].id       = id;
-        res[*cnt].distance = dist;
-        if (label) strncpy(res[*cnt].label, label, 255);
-        else        res[*cnt].label[0] = '\0';
-        res[*cnt].label[255] = '\0';
-        (*cnt)++;
-        for (int i = *cnt - 1; i > 0 && res[i].distance > res[i-1].distance; i--) {
-            PistaDBResult tmp = res[i]; res[i] = res[i-1]; res[i-1] = tmp;
-        }
-    } else if (dist < res[0].distance) {
-        res[0].id       = id;
-        res[0].distance = dist;
-        if (label) strncpy(res[0].label, label, 255);
-        else        res[0].label[0] = '\0';
-        res[0].label[255] = '\0';
-        int pos = 0;
-        for (;;) {
-            int worst = pos;
-            if (pos + 1 < *cnt && res[pos+1].distance > res[worst].distance) worst = pos + 1;
-            if (worst == pos) break;
-            PistaDBResult tmp = res[pos]; res[pos] = res[worst]; res[worst] = tmp;
-            pos = worst;
-        }
-    }
-}
-
-/* qsort comparator: ascending by distance. */
-static int sq_cmp_result(const void *a, const void *b) {
-    float da = ((const PistaDBResult *)a)->distance;
-    float db = ((const PistaDBResult *)b)->distance;
-    return (da > db) - (da < db);
-}
-
 int sq_search(const SQIndex *idx, const float *query, int k,
               PistaDBResult *results) {
     if (idx->size == 0 || k <= 0) return 0;
 
-    /* Fast path for the L2 family: ranking on integer codes is monotone with
-     * the true L2² distance only when every dimension shares the same scale,
-     * which is not the case for per-dim min/max.  Be safe and dequantise into
-     * a scratch buffer, then use the distance function the caller asked for.
-     *
-     * Stack-allocate the scratch buffer for the common embedding-size range
-     * (dim ≤ 1024 covers OpenAI / Cohere / sentence-transformers) and fall
-     * back to heap for larger configurations.  Removes the per-search
-     * malloc/free pair on the hot path while staying thread-safe.  Mirrors
-     * the pattern already used in index_ivf_pq.c. */
+    Heap heap;
+    if (heap_init(&heap, k + 4, 1) != PISTADB_OK) return 0;
+
     float  cand_stack[1024];
     float *cand = (idx->dim <= 1024) ? cand_stack
                                      : (float *)malloc(sizeof(float) * (size_t)idx->dim);
-    if (!cand) return 0;
+    if (!cand) { heap_free(&heap); return 0; }
 
     DistFn dfn = idx->dist_fn ? idx->dist_fn : dist_l2;
-    int cnt = 0;
     for (int i = 0; i < idx->size; i++) {
         if (idx->deleted[i]) continue;
         const uint8_t *codes = idx->codes + (size_t)i * (size_t)idx->dim;
         sq_dequantize_vec(codes, cand, idx->vmin, idx->vmax, idx->dim);
         float d = dfn(query, cand, idx->dim);
-        sq_result_insert(results, &cnt, k, idx->ids[i], d, VS_LABEL(&idx->vs, i));
+        if (heap.size < k) heap_push(&heap, d, (uint64_t)i);
+        else if (d < heap_top(&heap).key) { heap_pop(&heap); heap_push(&heap, d, (uint64_t)i); }
     }
     if (cand != cand_stack) free(cand);
 
-    /* O(k log k) final sort; the partial-result heap above only kept the top
-     * k as a max-heap-like array, so we still need to order ascending. */
-    if (cnt > 1) qsort(results, (size_t)cnt, sizeof(PistaDBResult), sq_cmp_result);
+    int cnt = heap.size;
+    for (int i = cnt - 1; i >= 0; i--) {
+        HeapItem it = heap_pop(&heap);
+        int s = (int)it.id;
+        results[i].id       = idx->ids[s];
+        results[i].distance = it.key;
+        memcpy(results[i].label, VS_LABEL(&idx->vs, s), 256);
+    }
+    heap_free(&heap);
     return cnt;
 }
 
@@ -400,6 +363,7 @@ int sq_load(SQIndex *idx, const void *buf, size_t size,
         idx->deleted[slot] = del;
         memcpy(idx->codes + (size_t)slot * (size_t)dim, codes, (size_t)dim);
         if (label) strncpy(VS_LABEL(&idx->vs, slot), label, 255);
+        else       VS_LABEL(&idx->vs, slot)[0] = '\0';
         VS_LABEL(&idx->vs, slot)[255] = '\0';
     }
 

@@ -26,18 +26,9 @@
 #  define PISTA_PREFETCH(p) ((void)0)
 #endif
 
-/* ── PCG RNG (module-level) ─────────────────────────────────────────────── */
-static PCG g_rng;
-static int g_rng_init = 0;
-
-static void ensure_rng(void) {
-    if (!g_rng_init) { pcg_seed(&g_rng, 42); g_rng_init = 1; }
-}
-
-/* ── Random layer assignment ─────────────────────────────────────────────── */
-static int random_level(float mL) {
-    ensure_rng();
-    float r = pcg_f32(&g_rng);
+/* ── Random layer assignment (per-instance RNG, thread-safe w/ external lock) ── */
+static int random_level(PCG *rng, float mL) {
+    float r = pcg_f32(rng);
     if (r < 1e-9f) r = 1e-9f;
     int level = (int)(-logf(r) * mL);
     if (level >= HNSW_MAX_LAYERS) level = HNSW_MAX_LAYERS - 1;
@@ -125,6 +116,7 @@ int hnsw_create(HNSWIndex *idx, int dim, DistFn dist_fn,
     idx->nodes   = (HNSWNode *)calloc((size_t)idx->node_cap, sizeof(HNSWNode));
     if (!idx->nodes) return PISTADB_ENOMEM;
     if (vs_init(&idx->vs, dim, idx->node_cap) != PISTADB_OK) return PISTADB_ENOMEM;
+    pcg_seed(&idx->rng, 42);
     return PISTADB_OK;
 }
 
@@ -174,6 +166,8 @@ static int search_layer(const HNSWIndex *idx, const float *query,
     heap_push(W, d_ep, (uint64_t)ep);   /* max-heap: furthest on top */
     epochset_set(visited, ep);
 
+    BatchDistFn batch_fn = idx->batch_fn;
+
     while (C->size > 0) {
         HeapItem c = heap_pop(C);       /* nearest candidate */
         float w_far = heap_top(W).key;  /* furthest in results */
@@ -221,9 +215,9 @@ static int search_layer(const HNSWIndex *idx, const float *query,
             fan_n++;
         }
         if (fan_n > 0) {
-            if (idx->batch_fn) {
-                idx->batch_fn(query, fan_ptrs, (size_t)fan_n,
-                              idx->dim, fan_dist);
+            if (batch_fn) {
+                batch_fn(query, fan_ptrs, (size_t)fan_n,
+                         idx->dim, fan_dist);
             } else {
                 for (int t = 0; t < fan_n; t++)
                     fan_dist[t] = query_dist(idx, query, fan_nb[t]);
@@ -285,7 +279,7 @@ int hnsw_insert(HNSWIndex *idx, uint64_t id, const char *label, const float *vec
     }
 
     int new_node = idx->n_nodes;
-    int level    = random_level(idx->mL);
+    int level    = random_level(&idx->rng, idx->mL);
 
     int r = node_init(&idx->nodes[new_node], id, level, idx->M, idx->M_max0);
     if (r != PISTADB_OK) return r;
@@ -566,7 +560,7 @@ int hnsw_save(const HNSWIndex *idx, void **out_buf, size_t *out_size) {
         WI32(n->level);
         memcpy(p, VS_LABEL(&idx->vs, i), 256); p += 256;
         const float *v = (const float *)VS_VEC(&idx->vs, i);
-        for (int d = 0; d < idx->dim; d++) WF32(v[d]);
+        memcpy(p, v, sizeof(float) * (size_t)idx->dim); p += sizeof(float) * (size_t)idx->dim;
         for (int l = 0; l <= n->level; l++) {
             WI32(n->neighbor_cnt[l]);
             for (int j = 0; j < n->neighbor_cnt[l]; j++)
@@ -607,7 +601,8 @@ int hnsw_load(HNSWIndex *idx, const void *buf, size_t size,
     /* Sanity-bound counts read from disk before using them for allocation.
      * M and M_max0 must respect the HNSW_MAX_M cap so the tmp_nb scratch
      * buffer in hnsw_insert cannot overflow when re-indexing. */
-    if (n_nodes < 0 || M < 2 || M > HNSW_MAX_M || M_max0 < 0 || M_max0 > 2 * HNSW_MAX_M ||
+    if (n_nodes < 0 || n_nodes > 500000000 || M < 2 || M > HNSW_MAX_M ||
+        M_max0 < 0 || M_max0 > 2 * HNSW_MAX_M ||
         ef_construction < 0 || ef_search < 0 ||
         max_layer >= HNSW_MAX_LAYERS) return PISTADB_ECORRUPT;
     if (ep_node < -1 || ep_node >= n_nodes) return PISTADB_ECORRUPT;
@@ -637,7 +632,7 @@ int hnsw_load(HNSWIndex *idx, const void *buf, size_t size,
         memcpy(VS_LABEL(&idx->vs, i), p, 256); p += 256;
         NEED((size_t)idx->dim * sizeof(float));
         float *v = VS_VEC(&idx->vs, i);
-        for (int d = 0; d < idx->dim; d++) v[d] = RF32();
+        memcpy(v, p, sizeof(float) * (size_t)idx->dim); p += sizeof(float) * (size_t)idx->dim;
 
         for (int l = 0; l <= level; l++) {
             NEED(4);

@@ -202,16 +202,24 @@ int diskann_insert(DiskANNIndex *idx, uint64_t id, const char *label, const floa
 
     greedy_search(idx, vec, idx->medoid, idx->L, &result, &visited);
 
-    /* Sort result ascending */
+    /* Sort result ascending — use stack for typical L/R to avoid per-insert
+     * heap allocations.  Fall back to heap for unusually large values. */
     int total = result.size;
-    float *ds     = (float *)malloc(sizeof(float) * (size_t)(total ? total : 1));
-    int   *ns     = (int   *)malloc(sizeof(int)   * (size_t)(total ? total : 1));
-    int   *chosen = (int   *)malloc(sizeof(int)   * (size_t)(idx->R + 4));
-    if (!ds || !ns || !chosen) {
-        free(ds); free(ns); free(chosen);
-        heap_free(&result); bitset_free(&visited);
-        return PISTADB_ENOMEM;
-    }
+    enum { DA_STACK_L = 512, DA_STACK_R = 128 };
+    float ds_stack[DA_STACK_L], *ds;
+    int   ns_stack[DA_STACK_L], *ns;
+    int   chosen_stack[DA_STACK_R], *chosen;
+    int   ds_heap = 0, ns_heap = 0, chosen_heap = 0;
+
+    if (total <= DA_STACK_L) { ds = ds_stack; ns = ns_stack; }
+    else { ds = (float *)malloc(sizeof(float) * (size_t)total); ns = (int *)malloc(sizeof(int) * (size_t)total);
+           if (!ds || !ns) { free(ds); free(ns); heap_free(&result); bitset_free(&visited); return PISTADB_ENOMEM; }
+           ds_heap = 1; ns_heap = 1; }
+    if (idx->R + 4 <= DA_STACK_R) { chosen = chosen_stack; }
+    else { chosen = (int *)malloc(sizeof(int) * (size_t)(idx->R + 4));
+           if (!chosen) { if (ds_heap) free(ds); if (ns_heap) free(ns);
+                          heap_free(&result); bitset_free(&visited); return PISTADB_ENOMEM; }
+           chosen_heap = 1; }
     for (int i = total - 1; i >= 0; i--) {
         HeapItem it = heap_pop(&result);
         ds[i] = it.key; ns[i] = (int)it.id;
@@ -228,9 +236,19 @@ int diskann_insert(DiskANNIndex *idx, uint64_t id, const char *label, const floa
      * leaving partial pruning state behind; the graph remains correct, just
      * slightly over-degree on the affected nodes. */
     int    max_nc = idx->R + 1;   /* nc ≤ R+1 after node_add_nb on a list capped at R */
-    float *nds    = (float *)malloc(sizeof(float) * (size_t)(max_nc + 1));
-    int   *nns    = (int   *)malloc(sizeof(int)   * (size_t)(max_nc + 1));
-    int   *pruned = (int   *)malloc(sizeof(int)   * (size_t)(idx->R + 4));
+    float nds_stack[DA_STACK_R + 2], *nds;
+    int   nns_stack[DA_STACK_R + 2], *nns;
+    int   pruned_stack[DA_STACK_R], *pruned;
+    int   nds_heap = 0, nns_heap = 0, pruned_heap = 0;
+    if (max_nc + 1 <= DA_STACK_R + 2) { nds = nds_stack; nns = nns_stack; }
+    else { nds = (float *)malloc(sizeof(float) * (size_t)(max_nc + 1));
+           nns = (int *)malloc(sizeof(int) * (size_t)(max_nc + 1));
+           if (!nds || !nns) { /* skip: graph stays slightly over-degree */
+               free(nds); free(nns); nds = NULL; nns = NULL; }
+           else { nds_heap = 1; nns_heap = 1; } }
+    if (idx->R + 4 <= DA_STACK_R) { pruned = pruned_stack; }
+    else { pruned = (int *)malloc(sizeof(int) * (size_t)(idx->R + 4));
+           if (!pruned) { pruned = NULL; } else { pruned_heap = 1; } }
 
     /* Bidirectional: add p as neighbor of each chosen */
     for (int i = 0; i < chosen_cnt; i++) {
@@ -249,9 +267,13 @@ int diskann_insert(DiskANNIndex *idx, uint64_t id, const char *label, const floa
             node_set_neighbors(&idx->nodes[nb], pruned, new_cnt);
         }
     }
-    free(nds); free(nns); free(pruned);
+    if (nds_heap) free(nds);
+    if (nns_heap) free(nns);
+    if (pruned_heap) free(pruned);
 
-    free(ds); free(ns); free(chosen);
+    if (ds_heap) free(ds);
+    if (ns_heap) free(ns);
+    if (chosen_heap) free(chosen);
     heap_free(&result);
     bitset_free(&visited);
     return PISTADB_OK;
@@ -279,18 +301,22 @@ int diskann_update(DiskANNIndex *idx, uint64_t id, const float *vec) {
 int diskann_build(DiskANNIndex *idx) {
     if (idx->n_nodes < 2) return PISTADB_OK;
 
-    /* Find medoid: average vector, nearest node */
-    float *avg = (float *)calloc((size_t)idx->dim, sizeof(float));
-    if (!avg) return PISTADB_ENOMEM;
+    /* Find medoid: accumulate centroid in double (avoids precision loss
+     * with float accumulation over millions of vectors). */
+    double *davg = (double *)calloc((size_t)idx->dim, sizeof(double));
+    if (!davg) return PISTADB_ENOMEM;
     int active = 0;
     for (int i = 0; i < idx->n_nodes; i++) {
         if (idx->nodes[i].deleted) continue;
         const float *v = (const float *)VS_VEC(&idx->vs, i);
-        for (int d = 0; d < idx->dim; d++) avg[d] += v[d];
+        for (int d = 0; d < idx->dim; d++) davg[d] += v[d];
         active++;
     }
-    if (active == 0) { free(avg); return PISTADB_OK; }
-    for (int d = 0; d < idx->dim; d++) avg[d] /= (float)active;
+    if (active == 0) { free(davg); return PISTADB_OK; }
+    float *avg = (float *)malloc(sizeof(float) * (size_t)idx->dim);
+    if (!avg) { free(davg); return PISTADB_ENOMEM; }
+    for (int d = 0; d < idx->dim; d++) avg[d] = (float)(davg[d] / active);
+    free(davg);
     float bd = FLT_MAX; int medoid = 0;
     for (int i = 0; i < idx->n_nodes; i++) {
         if (idx->nodes[i].deleted) continue;
@@ -393,12 +419,15 @@ int diskann_search(DiskANNIndex *idx, const float *query, int k,
     int total = result.size;
     int cnt   = 0;
     if (total > 0) {
-        float *ds = (float *)malloc(sizeof(float) * (size_t)total);
-        int   *ns = (int   *)malloc(sizeof(int)   * (size_t)total);
-        if (!ds || !ns) {
-            free(ds); free(ns);
-            heap_free(&result); bitset_free(&visited);
-            return 0;
+        float ds_stack[512], *ds;
+        int   ns_stack[512], *ns;
+        int   ds_heap = 0, ns_heap = 0;
+        if (total <= 512) { ds = ds_stack; ns = ns_stack; }
+        else {
+            ds = (float *)malloc(sizeof(float) * (size_t)total);
+            ns = (int   *)malloc(sizeof(int)   * (size_t)total);
+            if (!ds || !ns) { free(ds); free(ns); heap_free(&result); bitset_free(&visited); return 0; }
+            ds_heap = 1; ns_heap = 1;
         }
         /* Drain max-heap into ascending order. */
         for (int i = total - 1; i >= 0; i--) {
@@ -413,7 +442,8 @@ int diskann_search(DiskANNIndex *idx, const float *query, int k,
             results[cnt].label[255] = '\0';
             cnt++;
         }
-        free(ds); free(ns);
+        if (ds_heap) free(ds);
+        if (ns_heap) free(ns);
     }
     heap_free(&result);
     bitset_free(&visited);
@@ -475,7 +505,7 @@ int diskann_load(DiskANNIndex *idx, const void *buf, size_t size,
     int n_nodes = RI32(); int file_dim = RI32(); int R = RI32(); int L = RI32(); int medoid = RI32();
     float alpha = RF32();
     if (file_dim != dim) return PISTADB_ECORRUPT;
-    if (n_nodes < 0 || R < 0 || L < 0) return PISTADB_ECORRUPT;
+    if (n_nodes < 0 || n_nodes > 500000000 || R < 0 || L < 0) return PISTADB_ECORRUPT;
     if (medoid < -1 || medoid >= n_nodes) return PISTADB_ECORRUPT;
 
     int r = diskann_create(idx, dim, dist_fn, R, L, alpha);
