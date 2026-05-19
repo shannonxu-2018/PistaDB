@@ -65,4 +65,11 @@ int  diskann_save(const DiskANNIndex *idx, void **out_buf, size_t *out_size);
 int  diskann_load(DiskANNIndex *idx, const void *buf, size_t size,
                   int dim, DistFn dist_fn);
 
+/** SQLite-style paged load (see linear_load_paged / hnsw_load_paged).  The
+ *  Vamana graph stays resident; each node's label+vector are paged via a
+ *  per-node offset table.  Read-only. */
+int  diskann_load_paged(DiskANNIndex *idx, const char *path,
+                        uint64_t vec_off, uint64_t vec_size,
+                        int dim, DistFn dist_fn, size_t cache_bytes);
+
 #endif /* PISTADB_INDEX_DISKANN_H */

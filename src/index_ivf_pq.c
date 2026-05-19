@@ -230,7 +230,11 @@ static int pq_list_push(IVFPQIndex *idx, int c, uint64_t id, const uint8_t *code
     int entry_size = 8 + idx->M;
     if (idx->list_sizes[c] == idx->list_caps[c]) {
         int nc = idx->list_caps[c] * 2 + 8;
-        uint8_t *nl = (uint8_t *)realloc(idx->pq_lists[c], (size_t)(nc * entry_size));
+        /* (size_t) the operands before multiplying — nc*entry_size as int*int
+         * overflows once a single inverted list passes ~2^31/entry_size
+         * entries, yielding a too-small realloc and heap corruption. */
+        uint8_t *nl = (uint8_t *)realloc(idx->pq_lists[c],
+                                         (size_t)nc * (size_t)entry_size);
         if (!nl) return PISTADB_ENOMEM;
         idx->pq_lists[c] = nl; idx->list_caps[c] = nc;
     }
@@ -305,15 +309,73 @@ int ivfpq_delete(IVFPQIndex *idx, uint64_t id) {
     return PISTADB_ENOTFOUND;
 }
 
-int ivfpq_update(IVFPQIndex *idx, uint64_t id, const float *vec) {
-    /* Mark old deleted, re-insert with same id */
-    ivfpq_delete(idx, id);
-    /* Find label */
-    char lbl[256] = {0};
-    for (int i = 0; i < idx->n_vecs; i++) {
-        if (idx->all_ids[i] == id) { strncpy(lbl, VS_LABEL(&idx->vs, i), 255); break; }
+/* Swap-remove every posting whose id == `id`, across all clusters.  An id
+ * normally appears once; scanning all clusters also reclaims any stale
+ * posting an older (pre-fix) ivfpq_update may have leaked, so reopening an
+ * already-bloated file and updating a key self-heals it. */
+static void pq_lists_remove_id(IVFPQIndex *idx, uint64_t id) {
+    const size_t esz = (size_t)8 + (size_t)idx->M;
+    for (int c = 0; c < idx->nlist; c++) {
+        uint8_t *list = idx->pq_lists[c];
+        int n = idx->list_sizes[c];
+        for (int j = 0; j < n; ) {
+            uint64_t vid;
+            memcpy(&vid, list + (size_t)j * esz, sizeof vid);
+            if (vid == id) {
+                if (j != n - 1)
+                    memcpy(list + (size_t)j * esz,
+                           list + (size_t)(n - 1) * esz, esz);
+                n--;                       /* re-check the swapped-in entry */
+            } else {
+                j++;
+            }
+        }
+        idx->list_sizes[c] = n;
     }
-    return ivfpq_insert(idx, id, lbl, vec);
+}
+
+int ivfpq_update(IVFPQIndex *idx, uint64_t id, const float *vec) {
+    if (!idx->trained) return PISTADB_ENOTRAINED;
+
+    /* Proper update semantics: locate the existing live slot and reuse it.
+     * The old code did delete()+insert(), which allocated a brand-new slot
+     * (all_ids/all_deleted/labels grew by 1) and left the previous posting
+     * in place on every call — an unbounded slot+posting leak, plus search
+     * could then score the stale posting. */
+    int s = -1;
+    for (int i = 0; i < idx->n_vecs; i++)
+        if (idx->all_ids[i] == id && !idx->all_deleted[i]) { s = i; break; }
+    if (s < 0) return PISTADB_ENOTFOUND;
+
+    /* Drop the prior posting(s) so exactly one fresh posting remains. */
+    pq_lists_remove_id(idx, id);
+
+    /* Re-encode against the (possibly new) nearest centroid and append a
+     * single posting.  Slot/id/label are reused — no growth, no leak. */
+    int best_c = 0; float bd = FLT_MAX;
+    for (int c = 0; c < idx->nlist; c++) {
+        float d = dist_l2sq(vec, idx->coarse_centroids + (size_t)c * idx->dim,
+                            idx->dim);
+        if (d < bd) { bd = d; best_c = c; }
+    }
+    float   res_stack[1024];
+    uint8_t code_stack[256];
+    float  *res   = (idx->dim <= 1024) ? res_stack
+                                       : (float *)malloc(sizeof(float) * (size_t)idx->dim);
+    uint8_t *codes = (idx->M   <= 256 ) ? code_stack
+                                        : (uint8_t *)malloc((size_t)idx->M);
+    if (!res || !codes) {
+        if (res   != res_stack)  free(res);
+        if (codes != code_stack) free(codes);
+        return PISTADB_ENOMEM;
+    }
+    const float *cc = idx->coarse_centroids + (size_t)best_c * idx->dim;
+    for (int d = 0; d < idx->dim; d++) res[d] = vec[d] - cc[d];
+    pq_encode(idx, res, codes);
+    int r = pq_list_push(idx, best_c, id, codes);
+    if (res   != res_stack)  free(res);
+    if (codes != code_stack) free(codes);
+    return r;
 }
 
 /* ── Search ──────────────────────────────────────────────────────────────── */
@@ -347,8 +409,8 @@ int ivfpq_search(const IVFPQIndex *idx, const float *query, int k,
     Heap      cheap;
     if (n_probe + 1 <= (int)(sizeof cheap_stack / sizeof cheap_stack[0]))
         heap_init_with_buffer(&cheap, cheap_stack, n_probe + 1, 1); /* max-heap */
-    else
-        heap_init(&cheap, n_probe + 1, 1);
+    else if (heap_init(&cheap, n_probe + 1, 1) != PISTADB_OK)
+        return 0;   /* OOM: avoid NULL-deref in heap_push below */
     for (int c = 0; c < idx->nlist; c++) {
         float d = dist_l2sq(query, idx->coarse_centroids + (size_t)c*idx->dim, idx->dim);
         if (cheap.size < n_probe)
@@ -545,6 +607,11 @@ int ivfpq_load(IVFPQIndex *idx, const void *buf, size_t size, int dim, DistFn di
         memset(nd + idx->vec_cap, 0, (size_t)(nc - idx->vec_cap));
         idx->vec_cap = nc;
     }
+    /* id/label block must fit before we walk it with the unchecked RU64()/
+     * p+=256 macros (scann_load has this guard; ivfpq_load was missing it →
+     * OOB heap read on a truncated file). */
+    if ((size_t)n_vecs > (size_t)(end - p) / (sizeof(uint64_t) + 1 + 256))
+        return PISTADB_ECORRUPT;
     for (int i = 0; i < n_vecs; i++) {
         idx->all_ids[i] = RU64();
         idx->all_deleted[i] = *p++;

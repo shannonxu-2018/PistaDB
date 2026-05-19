@@ -74,4 +74,11 @@ int  ivf_save(const IVFIndex *idx, void **out_buf, size_t *out_size);
 int  ivf_load(IVFIndex *idx, const void *buf, size_t size,
               int dim, DistFn dist_fn);
 
+/** SQLite-style paged load (see linear_load_paged): centroids + posting
+ *  lists + id/deleted stay resident (small); the per-slot vector+label
+ *  block is served on demand through the LRU page cache.  Read-only. */
+int  ivf_load_paged(IVFIndex *idx, const char *path,
+                    uint64_t vec_off, uint64_t vec_size,
+                    int dim, DistFn dist_fn, size_t cache_bytes);
+
 #endif /* PISTADB_INDEX_IVF_H */

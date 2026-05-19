@@ -223,6 +223,66 @@ static int load_from_file(PistaDB *db) {
     /* Ranking-equivalent dist fn (see create_index for rationale). */
     db->dist_fn    = pistadb_get_rank_dist_fn(db->metric);
 
+    /* ── SQLite-style paged open ─────────────────────────────────────────
+     * Opt-in via PISTADB_PAGED (a non-"0" value).  Instead of loading the
+     * whole vector section into RAM, the file stays open behind a bounded
+     * LRU page cache so resident memory is capped regardless of file size.
+     * Default (env unset) keeps the exact previous behaviour, so this is a
+     * zero-risk addition for existing callers.  Wired for the raw-float-vector
+     * indices (LINEAR/IVF/LSH/HNSW/DiskANN); the code-compressed indices
+     * (SQ/IVF_PQ/ScaNN) are already compact and fall through to resident. */
+    {
+        const char *pe = getenv("PISTADB_PAGED");
+        if (pe && pe[0] && pe[0] != '0') {
+            size_t cache_bytes = 0;
+            const char *cb = getenv("PISTADB_PAGE_CACHE_BYTES");
+            if (cb && cb[0]) cache_bytes = (size_t)strtoull(cb, NULL, 10);
+            BatchDistFn pbfn = pistadb_get_batch_rank_dist_fn(db->metric);
+            int handled = 1, pr = PISTADB_OK;
+            switch (db->index_type) {
+                case INDEX_LINEAR:
+                    pr = linear_load_paged(&db->idx.linear, db->path,
+                                           hdr.vec_offset, hdr.vec_size,
+                                           db->dim, db->dist_fn, cache_bytes);
+                    if (pr == PISTADB_OK) db->idx.linear.batch_fn = pbfn;
+                    break;
+                case INDEX_IVF:
+                    pr = ivf_load_paged(&db->idx.ivf, db->path,
+                                        hdr.vec_offset, hdr.vec_size,
+                                        db->dim, db->dist_fn, cache_bytes);
+                    if (pr == PISTADB_OK) db->idx.ivf.batch_fn = pbfn;
+                    break;
+                case INDEX_LSH:
+                    pr = lsh_load_paged(&db->idx.lsh, db->path,
+                                        hdr.vec_offset, hdr.vec_size,
+                                        db->dim, db->dist_fn, db->metric,
+                                        cache_bytes);
+                    if (pr == PISTADB_OK) db->idx.lsh.batch_fn = pbfn;
+                    break;
+                case INDEX_HNSW:
+                    pr = hnsw_load_paged(&db->idx.hnsw, db->path,
+                                         hdr.vec_offset, hdr.vec_size,
+                                         db->dim, db->dist_fn, cache_bytes);
+                    if (pr == PISTADB_OK) db->idx.hnsw.batch_fn = pbfn;
+                    break;
+                case INDEX_DISKANN:
+                    pr = diskann_load_paged(&db->idx.diskann, db->path,
+                                            hdr.vec_offset, hdr.vec_size,
+                                            db->dim, db->dist_fn, cache_bytes);
+                    break;
+                default:
+                    handled = 0;   /* not paged → resident loader below */
+                    break;
+            }
+            if (handled) {
+                if (pr == PISTADB_OK) { recompute_n_active(db); return PISTADB_OK; }
+                free_active_index(db);
+                r = pr;
+                goto fail;
+            }
+        }
+    }
+
     void *vec_buf = NULL, *idx_buf = NULL;
     size_t vec_sz = 0, idx_sz = 0;
     r = storage_read_sections(db->path, &hdr, &vec_buf, &vec_sz, &idx_buf, &idx_sz);

@@ -45,4 +45,20 @@ int  linear_save(const LinearIndex *idx, void **out_buf, size_t *out_size);
 int  linear_load(LinearIndex *idx, const void *buf, size_t size,
                  int dim, DistFn dist_fn);
 
+/**
+ * SQLite-style paged load: the vector section stays in the file and is
+ * served on demand through a bounded LRU page cache, so resident memory is
+ * capped at `cache_bytes` instead of growing with the database.  Reads the
+ * existing on-disk format unchanged (no migration).  The resulting index is
+ * read-only for inserts/updates.
+ *
+ * @param path        .pst file path (kept open by the pager).
+ * @param vec_off     File offset of the vector section (hdr.vec_offset).
+ * @param vec_size    Byte size of the vector section (hdr.vec_size).
+ * @param cache_bytes Page-cache budget; 0 selects the 64 MiB default.
+ */
+int  linear_load_paged(LinearIndex *idx, const char *path,
+                        uint64_t vec_off, uint64_t vec_size,
+                        int dim, DistFn dist_fn, size_t cache_bytes);
+
 #endif /* PISTADB_INDEX_LINEAR_H */

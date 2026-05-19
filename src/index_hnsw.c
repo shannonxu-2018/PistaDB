@@ -273,6 +273,7 @@ int hnsw_insert(HNSWIndex *idx, uint64_t id, const char *label, const float *vec
      * accepting it as a real id would later be misread as a deleted node and
      * be skipped by every search. */
     if (id == UINT64_MAX) return PISTADB_EINVAL;
+    if (idx->vs.pager) return PISTADB_EINVAL;   /* read-only in paged mode */
     if (idx->n_nodes == idx->node_cap) {
         int r = hnsw_grow(idx);
         if (r != PISTADB_OK) return r;
@@ -415,6 +416,7 @@ int hnsw_delete(HNSWIndex *idx, uint64_t id) {
 }
 
 int hnsw_update(HNSWIndex *idx, uint64_t id, const float *vec) {
+    if (idx->vs.pager) return PISTADB_EINVAL;   /* read-only in paged mode */
     for (int i = 0; i < idx->n_nodes; i++) {
         if (idx->nodes[i].vec_id == id) {
             memcpy(VS_VEC(&idx->vs, i), vec, sizeof(float) * (size_t)idx->dim);
@@ -661,4 +663,105 @@ int hnsw_load(HNSWIndex *idx, const void *buf, size_t size,
 #undef RU64
 #undef RF32
     return PISTADB_OK;
+}
+
+/* ── Paged load ──────────────────────────────────────────────────────────────
+ * HNSW records are variable-size (per-layer neighbour lists), so a fixed
+ * stride can't address them — we build a per-node offset table instead.  The
+ * navigation graph (neighbours) is loaded resident (search must walk it);
+ * each node's label+vector are paged via vs->pg_off.  Read-only.
+ *
+ * On-disk (hnsw_save): [8×int32 header] then per node
+ *   [u64 vec_id][int32 level][char label[256]][float vec[dim]]
+ *   [per layer 0..level: int32 cnt, int32 neighbors[cnt]]
+ */
+int hnsw_load_paged(HNSWIndex *idx, const char *path,
+                    uint64_t vec_off, uint64_t vec_size,
+                    int dim, DistFn dist_fn, size_t cache_bytes) {
+    memset(idx, 0, sizeof(*idx));
+    idx->dim = dim;
+    idx->dist_fn = dist_fn;
+    idx->batch_fn = NULL;                 /* set by pistadb.c after load */
+    pcg_seed(&idx->rng, 42);
+
+    int rc = vs_open_paged(&idx->vs, path, vec_off, vec_size, dim, cache_bytes);
+    if (rc != PISTADB_OK) { memset(idx, 0, sizeof(*idx)); return rc; }
+    rc = PISTADB_ECORRUPT;
+
+    uint8_t h[32];
+    if (vec_size < 32 || vs_pg_get(&idx->vs, 0, 32, h) != PISTADB_OK) goto fail;
+    int32_t n_nodes, fdim, M, M_max0, ef_c, ef_s, ep_node, max_layer;
+    memcpy(&n_nodes,&h[0], 4); memcpy(&fdim,    &h[4],  4);
+    memcpy(&M,      &h[8], 4); memcpy(&M_max0,  &h[12], 4);
+    memcpy(&ef_c,   &h[16],4); memcpy(&ef_s,    &h[20], 4);
+    memcpy(&ep_node,&h[24],4); memcpy(&max_layer,&h[28],4);
+    if (fdim != dim) goto fail;
+    if (n_nodes < 0 || n_nodes > 500000000 || M < 2 || M > HNSW_MAX_M ||
+        M_max0 < 0 || M_max0 > 2 * HNSW_MAX_M || ef_c < 0 || ef_s < 0 ||
+        max_layer >= HNSW_MAX_LAYERS) goto fail;
+    if (ep_node < -1 || ep_node >= n_nodes) goto fail;
+
+    idx->M = M; idx->M_max0 = M_max0;
+    idx->ef_construction = ef_c; idx->ef_search = ef_s;
+    idx->mL = 1.0f / logf((float)M);
+    idx->ep_node = ep_node; idx->max_layer = max_layer;
+    idx->n_nodes = 0;
+    idx->node_cap = (n_nodes > 0) ? n_nodes : 1;
+    idx->nodes = (HNSWNode *)calloc((size_t)idx->node_cap, sizeof(HNSWNode));
+    idx->vs.pg_off = (uint64_t *)malloc(sizeof(uint64_t) *
+                                        (size_t)(n_nodes > 0 ? n_nodes : 1));
+    if (!idx->nodes || !idx->vs.pg_off) { rc = PISTADB_ENOMEM; goto fail; }
+    idx->vs.pg_lbl_rel = 8 + 4;            /* after vec_id + level         */
+    idx->vs.pg_vec_rel = 8 + 4 + 256;      /* + label[256]                 */
+
+    uint64_t cur = 32;
+    for (int i = 0; i < n_nodes; i++) {
+        uint64_t node_off = cur;
+        uint8_t  nh[12];
+        if (vs_pg_get(&idx->vs, cur, 12, nh) != PISTADB_OK) { rc = PISTADB_EIO; goto fail; }
+        uint64_t vec_id; int32_t level;
+        memcpy(&vec_id, nh,     8);
+        memcpy(&level,  nh + 8, 4);
+        cur += 12;
+        if (level < 0 || level >= HNSW_MAX_LAYERS) goto fail;
+
+        idx->vs.pg_off[i] = node_off;
+        cur += 256;                         /* skip label  (paged)         */
+        cur += (uint64_t)dim * sizeof(float); /* skip vector (paged)       */
+
+        if (node_init(&idx->nodes[i], vec_id, level, idx->M, idx->M_max0)
+                != PISTADB_OK) { rc = PISTADB_ENOMEM; goto fail; }
+        idx->n_nodes++;                     /* so hnsw_free unwinds cleanly */
+
+        for (int l = 0; l <= level; l++) {
+            int32_t cnt;
+            if (vs_pg_get(&idx->vs, cur, 4, &cnt) != PISTADB_OK) { rc = PISTADB_EIO; goto fail; }
+            cur += 4;
+            if (cnt < 0) goto fail;
+            if (cnt > idx->nodes[i].neighbor_cap[l]) {
+                int *nd = (int *)realloc(idx->nodes[i].neighbors[l],
+                                         sizeof(int) * (size_t)cnt);
+                if (!nd) { rc = PISTADB_ENOMEM; goto fail; }
+                idx->nodes[i].neighbors[l]    = nd;
+                idx->nodes[i].neighbor_cap[l] = cnt;
+            }
+            idx->nodes[i].neighbor_cnt[l] = cnt;
+            if (cnt > 0 &&
+                vs_pg_read(&idx->vs, cur, (uint64_t)cnt * 4,
+                           idx->nodes[i].neighbors[l]) != PISTADB_OK) {
+                rc = PISTADB_EIO; goto fail;
+            }
+            for (int j = 0; j < cnt; j++) {
+                int nb = idx->nodes[i].neighbors[l][j];
+                if (nb < 0 || nb >= n_nodes) goto fail;   /* OOB-read guard */
+            }
+            cur += (uint64_t)cnt * 4;
+        }
+    }
+    return PISTADB_OK;
+
+fail:
+    hnsw_free(idx);                         /* node_free + free(nodes) + vs_free */
+    memset(idx, 0, sizeof(*idx));
+    return rc;
 }

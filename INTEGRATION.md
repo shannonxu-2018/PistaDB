@@ -1,5 +1,9 @@
 # Integrating PistaDB into an external Python project
 
+> **In a hurry? Read [`DEPLOY.md`](DEPLOY.md) instead — copy two things, set one
+> env var, done.** This document is the *detailed reference*: every discovery
+> option, Docker, wheels, glibc/SIMD edge cases, and full troubleshooting.
+
 This guide walks through the complete flow for using PistaDB from a separate
 Python project, with **Linux x86_64 as the primary target**. Windows, macOS,
 and Linux ARM64 paths are noted alongside.

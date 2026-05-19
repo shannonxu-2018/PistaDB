@@ -20,6 +20,7 @@ cl %CFLAGS% /c /Fo"%OUTDIR%\distance.obj"        "%SRC%\distance.c" || exit /b 1
 cl %CFLAGS% /arch:AVX2 /c /Fo"%OUTDIR%\distance_avx2.obj" "%SRC%\distance_avx2.c" || exit /b 1
 cl %CFLAGS% /c /Fo"%OUTDIR%\utils.obj"            "%SRC%\utils.c" || exit /b 1
 cl %CFLAGS% /c /Fo"%OUTDIR%\storage.obj"          "%SRC%\storage.c" || exit /b 1
+cl %CFLAGS% /c /Fo"%OUTDIR%\pager.obj"            "%SRC%\pager.c" || exit /b 1
 cl %CFLAGS% /c /Fo"%OUTDIR%\index_linear.obj"     "%SRC%\index_linear.c" || exit /b 1
 cl %CFLAGS% /c /Fo"%OUTDIR%\index_hnsw.obj"       "%SRC%\index_hnsw.c" || exit /b 1
 cl %CFLAGS% /c /Fo"%OUTDIR%\index_ivf.obj"        "%SRC%\index_ivf.c" || exit /b 1
@@ -39,6 +40,7 @@ link %LDFLAGS% /DEF:"C:\projects\github\PistaDB\build\CMakeFiles\pistadb.dir\exp
     "%OUTDIR%\distance_avx2.obj" ^
     "%OUTDIR%\utils.obj" ^
     "%OUTDIR%\storage.obj" ^
+    "%OUTDIR%\pager.obj" ^
     "%OUTDIR%\index_linear.obj" ^
     "%OUTDIR%\index_hnsw.obj" ^
     "%OUTDIR%\index_ivf.obj" ^

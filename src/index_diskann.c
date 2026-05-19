@@ -179,6 +179,7 @@ static void node_set_neighbors(DiskANNNode *n, const int *nb, int cnt) {
 /* ── Insert ──────────────────────────────────────────────────────────────── */
 
 int diskann_insert(DiskANNIndex *idx, uint64_t id, const char *label, const float *vec) {
+    if (idx->vs.pager) return PISTADB_EINVAL;   /* read-only in paged mode */
     if (idx->n_nodes == idx->node_cap) {
         int r = da_grow(idx); if (r) return r;
     }
@@ -287,6 +288,7 @@ int diskann_delete(DiskANNIndex *idx, uint64_t id) {
 }
 
 int diskann_update(DiskANNIndex *idx, uint64_t id, const float *vec) {
+    if (idx->vs.pager) return PISTADB_EINVAL;   /* read-only in paged mode */
     for (int i = 0; i < idx->n_nodes; i++) {
         if (idx->nodes[i].vec_id == id) {
             memcpy(VS_VEC(&idx->vs, i), vec, sizeof(float) * (size_t)idx->dim);
@@ -545,4 +547,88 @@ int diskann_load(DiskANNIndex *idx, const void *buf, size_t size,
 #undef RU64
 #undef RF32
     return PISTADB_OK;
+}
+
+/* ── Paged load ──────────────────────────────────────────────────────────────
+ * Variable-stride per node (trailing neighbour list), same approach as
+ * hnsw_load_paged: graph resident, label+vector paged via a per-node offset
+ * table.  Read-only.
+ *
+ * On-disk (diskann_save): [int32 n_nodes,dim,R,L,medoid][float alpha] then
+ *   per node [u64 vec_id][int32 deleted][int32 nc][char label[256]]
+ *            [float vec[dim]][int32 neighbors[nc]]
+ */
+int diskann_load_paged(DiskANNIndex *idx, const char *path,
+                       uint64_t vec_off, uint64_t vec_size,
+                       int dim, DistFn dist_fn, size_t cache_bytes) {
+    memset(idx, 0, sizeof(*idx));
+    idx->dim = dim;
+    idx->dist_fn = dist_fn;
+
+    int rc = vs_open_paged(&idx->vs, path, vec_off, vec_size, dim, cache_bytes);
+    if (rc != PISTADB_OK) { memset(idx, 0, sizeof(*idx)); return rc; }
+    rc = PISTADB_ECORRUPT;
+
+    uint8_t h[24];
+    if (vec_size < 24 || vs_pg_get(&idx->vs, 0, 24, h) != PISTADB_OK) goto fail;
+    int32_t n_nodes, fdim, R, L, medoid;
+    float   alpha;
+    memcpy(&n_nodes,&h[0], 4); memcpy(&fdim,  &h[4],  4);
+    memcpy(&R,      &h[8], 4); memcpy(&L,     &h[12], 4);
+    memcpy(&medoid, &h[16],4); memcpy(&alpha, &h[20], 4);
+    if (fdim != dim) goto fail;
+    if (n_nodes < 0 || n_nodes > 500000000 || R < 0 || L < 0) goto fail;
+    if (medoid < -1 || medoid >= n_nodes) goto fail;
+
+    idx->R = R; idx->L = L; idx->alpha = alpha; idx->medoid = medoid;
+    idx->n_nodes = 0;
+    idx->node_cap = (n_nodes > 0) ? n_nodes : 1;
+    idx->nodes = (DiskANNNode *)calloc((size_t)idx->node_cap,
+                                       sizeof(DiskANNNode));
+    idx->vs.pg_off = (uint64_t *)malloc(sizeof(uint64_t) *
+                                        (size_t)(n_nodes > 0 ? n_nodes : 1));
+    if (!idx->nodes || !idx->vs.pg_off) { rc = PISTADB_ENOMEM; goto fail; }
+    idx->vs.pg_lbl_rel = 8 + 4 + 4;          /* after vec_id+deleted+nc    */
+    idx->vs.pg_vec_rel = 8 + 4 + 4 + 256;    /* + label[256]               */
+
+    uint64_t cur = 24;
+    for (int i = 0; i < n_nodes; i++) {
+        uint64_t node_off = cur;
+        uint8_t  nh[16];
+        if (vs_pg_get(&idx->vs, cur, 16, nh) != PISTADB_OK) { rc = PISTADB_EIO; goto fail; }
+        uint64_t vid; int32_t del, nc;
+        memcpy(&vid, nh,      8);
+        memcpy(&del, nh +  8, 4);
+        memcpy(&nc,  nh + 12, 4);
+        cur += 16;
+        if (nc < 0) goto fail;
+
+        idx->vs.pg_off[i] = node_off;
+        cur += 256;
+        cur += (uint64_t)dim * sizeof(float);
+
+        idx->nodes[i].vec_id       = vid;
+        idx->nodes[i].deleted      = del;
+        idx->nodes[i].neighbor_cnt = nc;
+        idx->nodes[i].neighbor_cap = nc + 4;
+        idx->nodes[i].neighbors    = (int *)malloc(sizeof(int) * (size_t)(nc + 4));
+        if (!idx->nodes[i].neighbors) { rc = PISTADB_ENOMEM; goto fail; }
+        idx->n_nodes++;                      /* so diskann_free unwinds */
+
+        if (nc > 0 &&
+            vs_pg_read(&idx->vs, cur, (uint64_t)nc * 4,
+                       idx->nodes[i].neighbors) != PISTADB_OK) {
+            rc = PISTADB_EIO; goto fail;
+        }
+        for (int j = 0; j < nc; j++) {
+            int nb = idx->nodes[i].neighbors[j];
+            if (nb < 0 || nb >= n_nodes) goto fail;   /* OOB-read guard */
+        }
+        cur += (uint64_t)nc * 4;
+    }
+    return PISTADB_OK;
+
+fail:
+    diskann_free(idx);                       /* frees neighbours+nodes+vs, memsets */
+    return rc;
 }

@@ -173,6 +173,7 @@ static int vec_store_grow_lsh(LSHIndex *idx) {
 }
 
 int lsh_insert(LSHIndex *idx, uint64_t id, const char *label, const float *vec) {
+    if (idx->vs.pager) return PISTADB_EINVAL;   /* read-only in paged mode */
     if (idx->n_vecs == idx->vec_cap) {
         int r = vec_store_grow_lsh(idx); if (r) return r;
     }
@@ -199,6 +200,7 @@ int lsh_delete(LSHIndex *idx, uint64_t id) {
 }
 
 int lsh_update(LSHIndex *idx, uint64_t id, const float *vec) {
+    if (idx->vs.pager) return PISTADB_EINVAL;   /* read-only in paged mode */
     for (int i = 0; i < idx->n_vecs; i++) {
         if (idx->vec_ids[i] == id && !idx->vec_deleted[i]) {
             memcpy(VS_VEC(&idx->vs, i), vec, sizeof(float) * (size_t)idx->dim);
@@ -401,9 +403,20 @@ int lsh_load(LSHIndex *idx, const void *buf, size_t size,
     for (int i = 0; i < n_vecs; i++) {
         uint64_t id = RU64(); uint8_t del = *p++; const char *lbl = (const char *)p; p += 256;
         const float *vec = (const float *)p; p += sizeof(float) * (size_t)dim;
-        r = lsh_insert(idx, id, lbl, vec);
-        if (r) return r;
-        idx->vec_deleted[idx->n_vecs - 1] = del;
+        /* Store raw vector/id/label only.  lsh_insert() would also hash this
+         * vector into all L tables, but every bucket is reloaded verbatim
+         * from the file in the table loop below — so the per-vector,
+         * per-table O(K·dim) hashing was pure waste on every load. */
+        if (idx->n_vecs == idx->vec_cap) {
+            r = vec_store_grow_lsh(idx);
+            if (r != PISTADB_OK) return r;
+        }
+        int slot = idx->n_vecs++;
+        idx->vec_ids[slot]     = id;
+        idx->vec_deleted[slot] = del;
+        memcpy(VS_VEC(&idx->vs, slot), vec, sizeof(float) * (size_t)idx->dim);
+        strncpy(VS_LABEL(&idx->vs, slot), lbl, 255);
+        VS_LABEL(&idx->vs, slot)[255] = '\0';
     }
     /* re-load table projections and buckets — verify each section fits in
      * the remaining buffer before trusting it. */
@@ -454,4 +467,126 @@ int lsh_load(LSHIndex *idx, const void *buf, size_t size,
 #undef RU64
 #undef RF32
     return PISTADB_OK;
+}
+
+/* ── Paged load ──────────────────────────────────────────────────────────────
+ * On-disk (lsh_save): [int32 L,K,dim,n_vecs,metric][float w][int32 n_vecs]
+ * [per slot: u64 id,u8 del,char[256],float[dim]]
+ * [per table: float proj[K*dim], float bias[K], int32 num_buckets,
+ *             per bucket: int32 size, int32 slots[size]].
+ * Hash tables + id/deleted stay resident; the fixed-stride vector+label
+ * block is paged. */
+int lsh_load_paged(LSHIndex *idx, const char *path,
+                   uint64_t vec_off, uint64_t vec_size,
+                   int dim, DistFn dist_fn, PistaDBMetric metric,
+                   size_t cache_bytes) {
+    memset(idx, 0, sizeof(*idx));
+    idx->dim = dim;
+    idx->dist_fn = dist_fn;
+    idx->batch_fn = NULL;                 /* set by pistadb.c after load */
+    idx->metric = metric;
+
+    int rc = vs_open_paged(&idx->vs, path, vec_off, vec_size, dim, cache_bytes);
+    if (rc != PISTADB_OK) { memset(idx, 0, sizeof(*idx)); return rc; }
+    rc = PISTADB_ECORRUPT;
+
+    uint8_t h[28];
+    if (vec_size < 28 || vs_pg_get(&idx->vs, 0, 28, h) != PISTADB_OK) goto fail;
+    int32_t L, K, fdim, n_vecs, met;
+    float   w;
+    memcpy(&L, &h[0], 4);  memcpy(&K,      &h[4],  4);
+    memcpy(&fdim, &h[8],4);memcpy(&n_vecs, &h[12], 4);
+    memcpy(&met,&h[16],4); memcpy(&w,      &h[20], 4);
+    /* h[24..27] = the vector-store count (== n_vecs); not needed. */
+    (void)met;
+    if (fdim != dim || L <= 0 || L > 100000 || K <= 0 || K > 64 || n_vecs < 0)
+        goto fail;
+
+    idx->L = L; idx->K = K; idx->w = w;
+    idx->n_vecs = n_vecs;
+    idx->vec_cap = (n_vecs > 0) ? n_vecs : 1;
+    idx->tables      = (LSHTable *)calloc((size_t)L, sizeof(LSHTable));
+    idx->vec_ids     = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)idx->vec_cap);
+    idx->vec_deleted = (uint8_t  *)malloc((size_t)idx->vec_cap);
+    if (!idx->tables || !idx->vec_ids || !idx->vec_deleted) {
+        rc = PISTADB_ENOMEM; goto fail;
+    }
+
+    const uint64_t stride = 8u + 1u + 256u + (uint64_t)dim * sizeof(float);
+    const uint64_t vbase  = 28u;
+    if (vec_size < vbase + (uint64_t)n_vecs * stride) goto fail;
+    idx->vs.pg_base    = vbase;
+    idx->vs.pg_stride  = stride;
+    idx->vs.pg_lbl_rel = 8 + 1;
+    idx->vs.pg_vec_rel = 8 + 1 + 256;
+
+    for (int i = 0; i < n_vecs; i++) {
+        uint8_t e9[9];
+        if (vs_pg_get(&idx->vs, vbase + (uint64_t)i * stride, 9, e9)
+                != PISTADB_OK) { rc = PISTADB_EIO; goto fail; }
+        memcpy(&idx->vec_ids[i], e9, 8);
+        idx->vec_deleted[i] = e9[8];
+    }
+
+    /* Hash tables (resident — consulted on every query). */
+    const int is_e2 = (metric == METRIC_L2 || metric == METRIC_L1) ? 1 : 0;
+    const uint64_t proj_b = sizeof(float) * (uint64_t)K * (uint64_t)dim;
+    const uint64_t bias_b = sizeof(float) * (uint64_t)K;
+    uint64_t po = vbase + (uint64_t)n_vecs * stride;
+    for (int l = 0; l < L; l++) {
+        LSHTable *t = &idx->tables[l];
+        t->K = K; t->w = w; t->is_e2lsh = is_e2;
+        t->proj = (float *)malloc(proj_b);
+        t->bias = (float *)malloc(bias_b);
+        if (!t->proj || !t->bias) { rc = PISTADB_ENOMEM; goto fail; }
+        if (vs_pg_read(&idx->vs, po, proj_b, t->proj) != PISTADB_OK) goto fail;
+        po += proj_b;
+        if (vs_pg_read(&idx->vs, po, bias_b, t->bias) != PISTADB_OK) goto fail;
+        po += bias_b;
+        int32_t nb;
+        if (vs_pg_get(&idx->vs, po, 4, &nb) != PISTADB_OK) goto fail;
+        po += 4;
+        if (nb <= 0 || nb > (1 << 24)) goto fail;
+        t->num_buckets = nb;
+        t->buckets = (LSHBucket *)calloc((size_t)nb, sizeof(LSHBucket));
+        if (!t->buckets) { rc = PISTADB_ENOMEM; goto fail; }
+        for (int b = 0; b < nb; b++) {
+            int32_t bs;
+            if (vs_pg_get(&idx->vs, po, 4, &bs) != PISTADB_OK) goto fail;
+            po += 4;
+            if (bs < 0) goto fail;
+            if (bs > 0) {
+                t->buckets[b].slots = (int *)malloc(sizeof(int) * (size_t)bs);
+                if (!t->buckets[b].slots) { rc = PISTADB_ENOMEM; goto fail; }
+                if (vs_pg_read(&idx->vs, po, (uint64_t)bs * 4,
+                               t->buckets[b].slots) != PISTADB_OK) goto fail;
+                po += (uint64_t)bs * 4;
+                for (int j = 0; j < bs; j++) {
+                    int s = t->buckets[b].slots[j];
+                    if (s < 0 || s >= n_vecs) goto fail;   /* OOB-read guard */
+                }
+                t->buckets[b].size = t->buckets[b].cap = bs;
+            }
+        }
+    }
+    return PISTADB_OK;
+
+fail:
+    if (idx->tables) {
+        for (int l = 0; l < idx->L; l++) {
+            LSHTable *t = &idx->tables[l];
+            free(t->proj); free(t->bias);
+            if (t->buckets) {
+                for (int b = 0; b < t->num_buckets; b++)
+                    free(t->buckets[b].slots);
+                free(t->buckets);
+            }
+        }
+        free(idx->tables);
+    }
+    free(idx->vec_ids);
+    free(idx->vec_deleted);
+    vs_free(&idx->vs);                    /* closes pager, frees rings */
+    memset(idx, 0, sizeof(*idx));
+    return rc;
 }

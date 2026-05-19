@@ -75,4 +75,11 @@ int  hnsw_save(const HNSWIndex *idx, void **out_buf, size_t *out_size);
 int  hnsw_load(HNSWIndex *idx, const void *buf, size_t size,
                int dim, DistFn dist_fn);
 
+/** SQLite-style paged load (see linear_load_paged).  The navigation graph
+ *  (per-node neighbour lists) stays resident; the variable-stride records'
+ *  label+vector are paged via a per-node offset table.  Read-only. */
+int  hnsw_load_paged(HNSWIndex *idx, const char *path,
+                     uint64_t vec_off, uint64_t vec_size,
+                     int dim, DistFn dist_fn, size_t cache_bytes);
+
 #endif /* PISTADB_INDEX_HNSW_H */

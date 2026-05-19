@@ -362,7 +362,11 @@ static int list_push(ScaNNIndex *idx, int c,
     int esz = entry_sz(idx);
     if (idx->list_sizes[c] == idx->list_caps[c]) {
         int nc = idx->list_caps[c] * 2 + 8;
-        uint8_t *nl = (uint8_t *)realloc(idx->lists[c], (size_t)(nc * esz));
+        /* (size_t) before the multiply: esz includes dim*4, so nc*esz as
+         * int*int overflows well before a list grows huge — a too-small
+         * realloc followed by entry writes is silent heap corruption. */
+        uint8_t *nl = (uint8_t *)realloc(idx->lists[c],
+                                         (size_t)nc * (size_t)esz);
         if (!nl) return PISTADB_ENOMEM;
         idx->lists[c]     = nl;
         idx->list_caps[c] = nc;
@@ -458,16 +462,74 @@ int scann_delete(ScaNNIndex *idx, uint64_t id) {
 
 /* ── Update ──────────────────────────────────────────────────────────────── */
 
-int scann_update(ScaNNIndex *idx, uint64_t id, const float *vec) {
-    scann_delete(idx, id);
-    char lbl[256] = {0};
-    for (int i = 0; i < idx->n_vecs; i++) {
-        if (idx->all_ids[i] == id) {
-            strncpy(lbl, VS_LABEL(&idx->vs, i), 255);
-            break;
+/* Swap-remove every posting whose id == `id`, across all partitions — see
+ * pq_lists_remove_id in index_ivf_pq.c for the rationale (same fix; ScaNN's
+ * entries are wider but the id is still the first 8 bytes). */
+static void scann_lists_remove_id(ScaNNIndex *idx, uint64_t id) {
+    const size_t esz = (size_t)entry_sz(idx);
+    for (int c = 0; c < idx->nlist; c++) {
+        uint8_t *list = idx->lists[c];
+        int n = idx->list_sizes[c];
+        for (int j = 0; j < n; ) {
+            uint64_t vid;
+            memcpy(&vid, list + (size_t)j * esz, sizeof vid);
+            if (vid == id) {
+                if (j != n - 1)
+                    memcpy(list + (size_t)j * esz,
+                           list + (size_t)(n - 1) * esz, esz);
+                n--;
+            } else {
+                j++;
+            }
         }
+        idx->list_sizes[c] = n;
     }
-    return scann_insert(idx, id, lbl, vec);
+}
+
+int scann_update(ScaNNIndex *idx, uint64_t id, const float *vec) {
+    if (!idx->trained) return PISTADB_ENOTRAINED;
+
+    /* Reuse the existing live slot.  The old delete()+insert() allocated a
+     * fresh slot and stranded the previous (stale) posting on every call —
+     * an unbounded leak, and Phase-2 rerank / pistadb_get could then return
+     * the pre-update vector. */
+    int s = -1;
+    for (int i = 0; i < idx->n_vecs; i++)
+        if (idx->all_ids[i] == id && !idx->all_deleted[i]) { s = i; break; }
+    if (s < 0) return PISTADB_ENOTFOUND;
+
+    scann_lists_remove_id(idx, id);   /* exactly one fresh posting remains */
+
+    int best = 0; float bd = FLT_MAX;
+    for (int c = 0; c < idx->nlist; c++) {
+        float d = dist_l2sq(vec, idx->centroids + (size_t)c * idx->dim,
+                            idx->dim);
+        if (d < bd) { bd = d; best = c; }
+    }
+    float   raw_r_stack[1024];
+    float   tilde_stack[1024];
+    uint8_t code_stack[256];
+    float  *raw_r   = (idx->dim <= 1024) ? raw_r_stack
+                                         : (float *)malloc(sizeof(float) * (size_t)idx->dim);
+    float  *r_tilde = (idx->dim <= 1024) ? tilde_stack
+                                         : (float *)malloc(sizeof(float) * (size_t)idx->dim);
+    uint8_t *codes  = (idx->pq_M <= 256) ? code_stack
+                                         : (uint8_t *)malloc((size_t)idx->pq_M);
+    if (!raw_r || !r_tilde || !codes) {
+        if (raw_r   != raw_r_stack) free(raw_r);
+        if (r_tilde != tilde_stack) free(r_tilde);
+        if (codes   != code_stack)  free(codes);
+        return PISTADB_ENOMEM;
+    }
+    const float *cc = idx->centroids + (size_t)best * idx->dim;
+    for (int d = 0; d < idx->dim; d++) raw_r[d] = vec[d] - cc[d];
+    aq_transform(raw_r, vec, idx->dim, idx->aq_eta, r_tilde);
+    pq_encode(idx, r_tilde, codes);
+    int r = list_push(idx, best, id, codes, vec);
+    if (raw_r   != raw_r_stack) free(raw_r);
+    if (r_tilde != tilde_stack) free(r_tilde);
+    if (codes   != code_stack)  free(codes);
+    return r;
 }
 
 /* ── Two-phase search ────────────────────────────────────────────────────── */
@@ -504,8 +566,8 @@ int scann_search(const ScaNNIndex *idx, const float *query, int k,
     Heap      cheap;
     if (nprobe + 1 <= (int)(sizeof cheap_stack / sizeof cheap_stack[0]))
         heap_init_with_buffer(&cheap, cheap_stack, nprobe + 1, 1); /* max-heap */
-    else
-        heap_init(&cheap, nprobe + 1, 1);
+    else if (heap_init(&cheap, nprobe + 1, 1) != PISTADB_OK)
+        return 0;   /* OOM: avoid NULL-deref in heap_push below */
     for (int c = 0; c < nlist; c++) {
         float d = dist_l2sq(query, idx->centroids + (size_t)c * dim, dim);
         if (cheap.size < nprobe)

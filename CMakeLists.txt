@@ -81,6 +81,7 @@ set(PISTADB_SOURCES
     ${PISTADB_SIMD_SOURCES}
     src/utils.c
     src/storage.c
+    src/pager.c
     src/index_linear.c
     src/index_hnsw.c
     src/index_ivf.c
@@ -106,6 +107,7 @@ set(PISTADB_HEADERS
     src/distance_simd.h
     src/utils.h
     src/storage.h
+    src/pager.h
     src/index_linear.h
     src/index_hnsw.h
     src/index_ivf.h

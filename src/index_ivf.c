@@ -194,6 +194,7 @@ static int list_push(IVFIndex *idx, int c, IVFPosting p) {
 }
 
 int ivf_insert(IVFIndex *idx, uint64_t id, const char *label, const float *vec) {
+    if (idx->vs.pager) return PISTADB_EINVAL;   /* read-only in paged mode */
     if (!idx->trained) return PISTADB_ENOTRAINED;
     if (idx->n_vecs == idx->vec_cap) {
         int r = vec_store_grow(idx);
@@ -223,6 +224,7 @@ int ivf_delete(IVFIndex *idx, uint64_t id) {
 }
 
 int ivf_update(IVFIndex *idx, uint64_t id, const float *vec) {
+    if (idx->vs.pager) return PISTADB_EINVAL;   /* read-only in paged mode */
     for (int i = 0; i < idx->n_vecs; i++) {
         if (idx->vec_ids[i] == id && !idx->vec_deleted[i]) {
             memcpy(VS_VEC(&idx->vs, i), vec, sizeof(float) * (size_t)idx->dim);
@@ -248,8 +250,8 @@ int ivf_search(const IVFIndex *idx, const float *query, int k,
     Heap      cheap;
     if (n_probe + 1 <= (int)(sizeof cheap_stack / sizeof cheap_stack[0])) {
         heap_init_with_buffer(&cheap, cheap_stack, n_probe + 1, 1); /* max-heap */
-    } else {
-        heap_init(&cheap, n_probe + 1, 1);
+    } else if (heap_init(&cheap, n_probe + 1, 1) != PISTADB_OK) {
+        return 0;   /* OOM: cheap.data would be NULL → heap_push NULL-derefs */
     }
     for (int c = 0; c < idx->nlist; c++) {
         float d = dist_l2sq(query,
@@ -430,14 +432,34 @@ int ivf_load(IVFIndex *idx, const void *buf, size_t size, int dim, DistFn dist_f
     memcpy(idx->centroids, p, sizeof(float) * (size_t)(nlist * dim));
     p += sizeof(float) * (size_t)(nlist * dim);
 
+    /* The vector block must fit before we walk it — without this guard a
+     * truncated/corrupt file drives the unchecked RU64()/p+=256 macros past
+     * `end`, an out-of-bounds heap read (every other loader bounds-checks
+     * here; ivf_load did not). */
+    const size_t ivf_entry = sizeof(uint64_t) + 1 + 256
+                           + sizeof(float) * (size_t)dim;
+    if ((size_t)n_vecs > (size_t)(end - p) / (ivf_entry ? ivf_entry : 1))
+        return PISTADB_ECORRUPT;
+
     for (int i = 0; i < n_vecs; i++) {
         uint64_t id  = RU64();
         uint8_t  del = *p++;
         const char *lbl = (const char *)p; p += 256;
         const float *vec = (const float *)p; p += sizeof(float) * (size_t)dim;
-        r = ivf_insert(idx, id, lbl, vec);
-        if (r != PISTADB_OK) return r;
-        idx->vec_deleted[idx->n_vecs - 1] = del;
+        /* Store the raw vector/id/label directly.  ivf_insert() would also
+         * run an O(nlist·dim) nearest-centroid scan and append a posting,
+         * but the posting lists are reloaded verbatim from the file in the
+         * loop below — so that work was pure waste on every load. */
+        if (idx->n_vecs == idx->vec_cap) {
+            r = vec_store_grow(idx);
+            if (r != PISTADB_OK) return r;
+        }
+        int slot = idx->n_vecs++;
+        idx->vec_ids[slot]     = id;
+        idx->vec_deleted[slot] = del;
+        memcpy(VS_VEC(&idx->vs, slot), vec, sizeof(float) * (size_t)idx->dim);
+        strncpy(VS_LABEL(&idx->vs, slot), lbl, 255);
+        VS_LABEL(&idx->vs, slot)[255] = '\0';
     }
     /* Now overwrite posting lists (ivf_insert already built them, but re-read) */
     /* Reset lists */
@@ -464,4 +486,105 @@ int ivf_load(IVFIndex *idx, const void *buf, size_t size, int dim, DistFn dist_f
 #undef RI32
 #undef RU64
     return PISTADB_OK;
+}
+
+/* ── Paged load ──────────────────────────────────────────────────────────────
+ * On-disk layout (ivf_save): [int32 nlist,dim,nprobe,trained,n_vecs]
+ * [float centroids[nlist*dim]] [per slot: u64 id,u8 del,char[256],float[dim]]
+ * [per cluster: int32 size, (u64 id,int32 slot)*size].
+ * Centroids + posting lists + id/deleted are kept resident (small); only the
+ * fixed-stride per-slot vector+label block is paged. */
+int ivf_load_paged(IVFIndex *idx, const char *path,
+                   uint64_t vec_off, uint64_t vec_size,
+                   int dim, DistFn dist_fn, size_t cache_bytes) {
+    memset(idx, 0, sizeof(*idx));
+    idx->dim = dim;
+    idx->dist_fn = dist_fn;
+    idx->batch_fn = NULL;                 /* set by pistadb.c after load */
+
+    int rc = vs_open_paged(&idx->vs, path, vec_off, vec_size, dim, cache_bytes);
+    if (rc != PISTADB_OK) { memset(idx, 0, sizeof(*idx)); return rc; }
+    rc = PISTADB_ECORRUPT;
+
+    uint8_t h[20];
+    if (vec_size < 20 || vs_pg_get(&idx->vs, 0, 20, h) != PISTADB_OK) goto fail;
+    int32_t nlist, fdim, nprobe, trained, n_vecs;
+    memcpy(&nlist, &h[0], 4);  memcpy(&fdim,    &h[4],  4);
+    memcpy(&nprobe,&h[8], 4);  memcpy(&trained, &h[12], 4);
+    memcpy(&n_vecs,&h[16],4);
+    if (fdim != dim || nlist <= 0 || nlist > 1000000 || n_vecs < 0) goto fail;
+
+    idx->nlist   = nlist;
+    idx->nprobe  = nprobe;
+    idx->trained = trained;
+    idx->n_vecs  = n_vecs;
+    idx->vec_cap = (n_vecs > 0) ? n_vecs : 1;
+
+    idx->centroids  = (float *)malloc(sizeof(float) * (size_t)nlist * (size_t)dim);
+    idx->lists      = (IVFPosting **)calloc((size_t)nlist, sizeof(IVFPosting *));
+    idx->list_sizes = (int *)calloc((size_t)nlist, sizeof(int));
+    idx->list_caps  = (int *)calloc((size_t)nlist, sizeof(int));
+    idx->vec_ids    = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)idx->vec_cap);
+    idx->vec_deleted= (uint8_t  *)malloc((size_t)idx->vec_cap);
+    if (!idx->centroids || !idx->lists || !idx->list_sizes ||
+        !idx->list_caps || !idx->vec_ids || !idx->vec_deleted) {
+        rc = PISTADB_ENOMEM; goto fail;
+    }
+
+    /* Centroids: resident (consulted by every query). */
+    uint64_t cc_bytes = sizeof(float) * (uint64_t)nlist * (uint64_t)dim;
+    if (vs_pg_read(&idx->vs, 20, cc_bytes, idx->centroids) != PISTADB_OK)
+        goto fail;
+
+    const uint64_t stride = 8u + 1u + 256u + (uint64_t)dim * sizeof(float);
+    const uint64_t vbase  = 20u + cc_bytes;
+    if (vec_size < vbase + (uint64_t)n_vecs * stride) goto fail;
+    idx->vs.pg_base    = vbase;
+    idx->vs.pg_stride  = stride;
+    idx->vs.pg_lbl_rel = 8 + 1;
+    idx->vs.pg_vec_rel = 8 + 1 + 256;
+
+    for (int i = 0; i < n_vecs; i++) {
+        uint8_t e9[9];
+        if (vs_pg_get(&idx->vs, vbase + (uint64_t)i * stride, 9, e9)
+                != PISTADB_OK) { rc = PISTADB_EIO; goto fail; }
+        memcpy(&idx->vec_ids[i], e9, 8);
+        idx->vec_deleted[i] = e9[8];
+    }
+
+    /* Posting lists (resident — 12 bytes/posting). */
+    uint64_t po = vbase + (uint64_t)n_vecs * stride;
+    for (int c = 0; c < nlist; c++) {
+        int32_t ls;
+        if (vs_pg_get(&idx->vs, po, 4, &ls) != PISTADB_OK) goto fail;
+        po += 4;
+        if (ls < 0) goto fail;
+        idx->lists[c] = (IVFPosting *)malloc(sizeof(IVFPosting) * (size_t)(ls + 1));
+        if (!idx->lists[c]) { rc = PISTADB_ENOMEM; goto fail; }
+        idx->list_caps[c]  = ls + 1;
+        idx->list_sizes[c] = ls;
+        for (int j = 0; j < ls; j++) {
+            uint8_t pe[12];
+            if (vs_pg_get(&idx->vs, po, 12, pe) != PISTADB_OK) goto fail;
+            po += 12;
+            memcpy(&idx->lists[c][j].id, pe, 8);
+            int32_t s; memcpy(&s, pe + 8, 4);
+            if (s < 0 || s >= n_vecs) goto fail;   /* OOB-read guard */
+            idx->lists[c][j].slot = s;
+        }
+    }
+    return PISTADB_OK;
+
+fail:
+    if (idx->lists)
+        for (int c = 0; c < idx->nlist; c++) free(idx->lists[c]);
+    free(idx->centroids);
+    free(idx->lists);
+    free(idx->list_sizes);
+    free(idx->list_caps);
+    free(idx->vec_ids);
+    free(idx->vec_deleted);
+    vs_free(&idx->vs);                    /* closes pager, frees rings */
+    memset(idx, 0, sizeof(*idx));
+    return rc;
 }

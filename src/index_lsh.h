@@ -75,4 +75,12 @@ int  lsh_save(const LSHIndex *idx, void **out_buf, size_t *out_size);
 int  lsh_load(LSHIndex *idx, const void *buf, size_t size,
               int dim, DistFn dist_fn, PistaDBMetric metric);
 
+/** SQLite-style paged load (see linear_load_paged): hash tables + id/deleted
+ *  stay resident; the fixed-stride per-slot vector+label block is paged.
+ *  Read-only. */
+int  lsh_load_paged(LSHIndex *idx, const char *path,
+                    uint64_t vec_off, uint64_t vec_size,
+                    int dim, DistFn dist_fn, PistaDBMetric metric,
+                    size_t cache_bytes);
+
 #endif /* PISTADB_INDEX_LSH_H */

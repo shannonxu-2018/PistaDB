@@ -501,6 +501,80 @@ class TestScaNN:
         assert recall >= 0.5, f"ScaNN recall@{K} = {recall:.2f} < 0.5"
 
 
+# ── Update compaction (regression: IVF_PQ / ScaNN update slot+posting leak) ────
+
+class TestUpdateCompaction:
+    """Regression guard: ivfpq_update / scann_update used to delete+insert a
+    brand-new slot on every call (unbounded slot+posting growth) and could
+    then return the pre-update vector.  Update must now reuse the slot, purge
+    the stale posting, and persist a constant-size file regardless of how
+    many times a key is updated."""
+
+    DIM = 16
+    N   = 120
+
+    @staticmethod
+    def _build(path, index):
+        rng  = np.random.default_rng(11)
+        vecs = rng.random((TestUpdateCompaction.N,
+                           TestUpdateCompaction.DIM), dtype=np.float32)
+        if index is Index.IVF_PQ:
+            params = Params(ivf_nlist=8, ivf_nprobe=4, pq_M=4, pq_nbits=8)
+        else:
+            params = Params(scann_nlist=8, scann_nprobe=4, scann_pq_M=4,
+                            scann_pq_bits=8, scann_rerank_k=20,
+                            scann_aq_eta=0.2)
+        db = PistaDB(path, dim=TestUpdateCompaction.DIM, metric=Metric.L2,
+                     index=index, params=params)
+        db.train(vecs)
+        for i, v in enumerate(vecs):
+            db.insert(i + 1, v)
+        return db
+
+    @pytest.mark.parametrize("index", [Index.IVF_PQ, Index.SCANN])
+    def test_repeated_update_does_not_grow_file(self, tmp_path, index):
+        p1 = str(tmp_path / f"upd1_{index.name}.pst")
+        p2 = str(tmp_path / f"upd40_{index.name}.pst")
+        rng = np.random.default_rng(99)
+
+        db = self._build(p1, index)
+        db.update(1, rng.random(self.DIM, dtype=np.float32))
+        db.save(); db.close()
+        size_1_update = os.path.getsize(p1)
+
+        db = self._build(p2, index)
+        for _ in range(40):
+            db.update(1, rng.random(self.DIM, dtype=np.float32))
+        assert db.count == self.N            # no slot growth
+        db.save(); db.close()
+        size_40_updates = os.path.getsize(p2)
+
+        # With the leak, 40 updates would add ~39 extra slots + postings.
+        assert size_40_updates == size_1_update, (
+            f"{index.name}: file grew {size_1_update} -> {size_40_updates} "
+            f"after repeated updates (slot/posting leak)")
+
+    @pytest.mark.parametrize("index", [Index.IVF_PQ, Index.SCANN])
+    def test_update_value_not_stale_after_reopen(self, tmp_path, index):
+        path = str(tmp_path / f"updval_{index.name}.pst")
+        target = np.full(self.DIM, 0.123456, dtype=np.float32)
+
+        db = self._build(path, index)
+        db.update(1, target)
+        db.save(); db.close()
+
+        with PistaDB(path, dim=self.DIM) as db2:
+            res = db2.search(target, k=5)
+            assert 1 in [r.id for r in res], \
+                f"{index.name}: updated vector not found after reopen (stale)"
+            if index is Index.SCANN:
+                # ScaNN reconstructs the exact raw vector; it must be the
+                # post-update value, never the stale pre-update one (bug #2).
+                vec, _ = db2.get(1)
+                assert np.allclose(vec, target, atol=1e-5), \
+                    f"ScaNN get(1) returned a stale vector: {vec[:3]}"
+
+
 # ── EmbeddingCache tests ───────────────────────────────────────────────────────
 
 class TestEmbeddingCache:

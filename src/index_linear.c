@@ -11,6 +11,7 @@
 #include "utils.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <float.h>
 
 #define INITIAL_CAP 64
@@ -73,6 +74,9 @@ int linear_find_id(const LinearIndex *idx, uint64_t id) {
 }
 
 int linear_insert(LinearIndex *idx, uint64_t id, const char *label, const float *vec) {
+    /* Paged mode serves vectors read-only from the file; there is nowhere to
+     * write a new one without rewriting the paged region. */
+    if (idx->vs.pager) return PISTADB_EINVAL;
     if (idx->size == idx->cap) {
         int r = linear_grow(idx);
         if (r != PISTADB_OK) return r;
@@ -95,6 +99,7 @@ int linear_delete(LinearIndex *idx, uint64_t id) {
 }
 
 int linear_update(LinearIndex *idx, uint64_t id, const float *vec) {
+    if (idx->vs.pager) return PISTADB_EINVAL;   /* read-only in paged mode */
     int slot = linear_find_id(idx, id);
     if (slot < 0) return PISTADB_ENOTFOUND;
     memcpy(VS_VEC(&idx->vs, slot), vec, sizeof(float) * (size_t)idx->dim);
@@ -219,4 +224,71 @@ int linear_load(LinearIndex *idx, const void *buf, size_t size,
         idx->deleted[idx->size - 1] = del;
     }
     return PISTADB_OK;
+}
+
+/* ── Paged load (SQLite-style demand paging) ─────────────────────────────────
+ *
+ * Instead of malloc()+fread()ing the whole vector section and copying it into
+ * resident chunks, keep the file open behind a bounded LRU page cache and
+ * resolve VS_VEC/VS_LABEL on demand.  Only the small per-slot id+deleted
+ * arrays stay resident (9 bytes/vector vs 256+dim*4); the bulk vector/label
+ * data is paged.  Reads the existing on-disk layout verbatim:
+ *
+ *   [int32 size][int32 dim] then per slot:
+ *   [u64 id][u8 deleted][char label[256]][float vec[dim]]
+ */
+int linear_load_paged(LinearIndex *idx, const char *path,
+                       uint64_t vec_off, uint64_t vec_size,
+                       int dim, DistFn dist_fn, size_t cache_bytes) {
+    memset(idx, 0, sizeof(*idx));
+    idx->dim     = dim;
+    idx->dist_fn = dist_fn;
+    idx->batch_fn = NULL;                 /* set by pistadb.c after load */
+
+    int rc = vs_open_paged(&idx->vs, path, vec_off, vec_size, dim, cache_bytes);
+    if (rc != PISTADB_OK) { memset(idx, 0, sizeof(*idx)); return rc; }
+    rc = PISTADB_ECORRUPT;
+
+    /* Mini-header lives at region offset 0 (read via the pager itself). */
+    uint8_t hdr[8];
+    if (vec_size < 8 || vs_pg_get(&idx->vs, 0, 8, hdr) != PISTADB_OK)
+        goto fail;
+    int32_t count, fdim;
+    memcpy(&count, hdr,     4);
+    memcpy(&fdim,  hdr + 4, 4);
+    if (fdim != dim || count < 0) goto fail;
+
+    const uint64_t entry = 8u + 1u + 256u + (uint64_t)dim * sizeof(float);
+    if (vec_size < 8u + (uint64_t)count * entry) goto fail;
+
+    idx->vs.pg_base    = 8;               /* skip the mini-header        */
+    idx->vs.pg_stride  = entry;
+    idx->vs.pg_lbl_rel = 8 + 1;           /* id(8) + deleted(1)          */
+    idx->vs.pg_vec_rel = 8 + 1 + 256;     /* + label(256)                */
+
+    int n = (count > 0) ? count : 1;
+    idx->ids     = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)n);
+    idx->deleted = (uint8_t  *)malloc((size_t)n);
+    if (!idx->ids || !idx->deleted) { rc = PISTADB_ENOMEM; goto fail; }
+    idx->size = count;
+    idx->cap  = count;
+
+    /* One sequential pass to populate the small resident id/deleted arrays.
+     * Sequential offsets keep the pages hot, so this is page-cache friendly. */
+    for (int i = 0; i < count; i++) {
+        uint8_t e9[9];
+        if (vs_pg_get(&idx->vs,
+                       idx->vs.pg_base + (uint64_t)i * idx->vs.pg_stride,
+                       9, e9) != PISTADB_OK) { rc = PISTADB_EIO; goto fail; }
+        memcpy(&idx->ids[i], e9, 8);
+        idx->deleted[i] = e9[8];
+    }
+    return PISTADB_OK;
+
+fail:
+    vs_free(&idx->vs);                    /* closes pager, frees rings */
+    free(idx->ids);
+    free(idx->deleted);
+    memset(idx, 0, sizeof(*idx));
+    return rc;
 }
